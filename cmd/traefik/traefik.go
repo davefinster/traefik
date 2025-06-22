@@ -195,6 +195,7 @@ func setupServer(staticConfiguration *static.Configuration) (*server.Server, err
 
 	acmeProviders := initACMEProvider(staticConfiguration, providerAggregator, tlsManager, httpChallengeProvider, tlsChallengeProvider, routinesPool)
 
+	remoteACMEProviders := initRemoteACMEProvider(staticConfiguration, providerAggregator, routinesPool)
 	// Tailscale
 
 	tsProviders := initTailscaleProviders(staticConfiguration, providerAggregator)
@@ -368,6 +369,12 @@ func setupServer(staticConfiguration *static.Configuration) (*server.Server, err
 		watcher.AddListener(p.ListenConfiguration)
 	}
 
+	// Remote ACME
+	for _, p := range remoteACMEProviders {
+		resolverNames[p.ResolverName] = struct{}{}
+		watcher.AddListener(p.ListenConfiguration)
+	}
+
 	// Tailscale
 	for _, p := range tsProviders {
 		resolverNames[p.ResolverName] = struct{}{}
@@ -450,13 +457,14 @@ func switchRouter(routerFactory *server.RouterFactory, serverEntryPointsTCP serv
 // initACMEProvider creates and registers acme.Provider instances corresponding to the configured ACME certificate resolvers.
 func initACMEProvider(c *static.Configuration, providerAggregator *aggregator.ProviderAggregator, tlsManager *traefiktls.Manager, httpChallengeProvider, tlsChallengeProvider challenge.Provider, routinesPool *safe.Pool) []*acme.Provider {
 	localStores := map[string]*acme.LocalStore{}
-
 	var resolvers []*acme.Provider
 	for name, resolver := range c.CertificatesResolvers {
 		if resolver.ACME == nil {
 			continue
 		}
-
+		if len(resolver.ACME.RemoteEndpoint) > 0 {
+			continue
+		}
 		if localStores[resolver.ACME.Storage] == nil {
 			localStores[resolver.ACME.Storage] = acme.NewLocalStore(resolver.ACME.Storage, routinesPool)
 		}
@@ -480,7 +488,31 @@ func initACMEProvider(c *static.Configuration, providerAggregator *aggregator.Pr
 
 		resolvers = append(resolvers, p)
 	}
+	return resolvers
+}
 
+// initACMEProvider creates and registers acme.Provider instances corresponding to the configured ACME certificate resolvers.
+func initRemoteACMEProvider(c *static.Configuration, providerAggregator *aggregator.ProviderAggregator, routinesPool *safe.Pool) []*acme.RemoteProvider {
+	var resolvers []*acme.RemoteProvider
+	for name, resolver := range c.CertificatesResolvers {
+		if resolver.ACME == nil {
+			continue
+		}
+		p := &acme.RemoteProvider{
+			Configuration: resolver.ACME,
+			Store:         acme.NewRemoteStore(resolver.ACME.RemoteEndpoint, routinesPool),
+			ResolverName:  name,
+		}
+		if err := providerAggregator.AddProvider(p); err != nil {
+			log.Error().Err(err).Str("resolver", name).Msg("The ACME resolve is skipped from the resolvers list")
+			continue
+		}
+
+		p.SetConfigListenerChan(make(chan dynamic.Configuration))
+
+		resolvers = append(resolvers, p)
+	}
+	fmt.Printf("resolvers: %+v\n", resolvers)
 	return resolvers
 }
 

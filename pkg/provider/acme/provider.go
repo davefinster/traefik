@@ -40,6 +40,7 @@ const resolverSuffix = ".acme"
 
 // Configuration holds ACME configuration provided by users.
 type Configuration struct {
+	RemoteEndpoint       string   `description:"Endpoint from which to fetch configs" json:"remoteEndpoint,omitempty" toml:"remoteEndpoint,omitempty" yaml:"remoteEndpoint,omitempty"`
 	Email                string   `description:"Email address used for registration." json:"email,omitempty" toml:"email,omitempty" yaml:"email,omitempty"`
 	CAServer             string   `description:"CA server to use." json:"caServer,omitempty" toml:"caServer,omitempty" yaml:"caServer,omitempty"`
 	PreferredChain       string   `description:"Preferred chain to use." json:"preferredChain,omitempty" toml:"preferredChain,omitempty" yaml:"preferredChain,omitempty" export:"true"`

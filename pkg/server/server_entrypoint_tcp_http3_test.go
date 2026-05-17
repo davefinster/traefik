@@ -5,6 +5,7 @@ import (
 	"context"
 	"crypto/tls"
 	"crypto/x509"
+	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -222,6 +223,89 @@ func TestHTTP30RTT(t *testing.T) {
 
 	// 0RTT need to be false.
 	assert.False(t, earlyConnection.ConnectionState().Used0RTT)
+}
+
+func TestHTTP3InitialPacketSize(t *testing.T) {
+	epConfig := &static.EntryPointsTransport{}
+	epConfig.SetDefaults()
+
+	testCases := []struct {
+		desc       string
+		size       int
+		expectErr  bool
+		expectSize uint16
+	}{
+		{
+			desc: "unset leaves the quic-go default",
+			size: 0,
+		},
+		{
+			desc:       "at the minimum",
+			size:       1200,
+			expectSize: 1200,
+		},
+		{
+			desc:       "above the minimum",
+			size:       1452,
+			expectSize: 1452,
+		},
+		{
+			desc:      "below the minimum is rejected",
+			size:      1199,
+			expectErr: true,
+		},
+	}
+
+	for _, test := range testCases {
+		t.Run(test.desc, func(t *testing.T) {
+			t.Parallel()
+
+			entryPoint, err := NewTCPEntryPoint(t.Context(), "foo", &static.EntryPoint{
+				Address:          "127.0.0.1:0",
+				Transport:        epConfig,
+				ForwardedHeaders: &static.ForwardedHeaders{},
+				HTTP2:            &static.HTTP2Config{},
+				HTTP3: &static.HTTP3Config{
+					InitialPacketSize: test.size,
+				},
+			}, nil, nil)
+
+			if test.expectErr {
+				require.Error(t, err)
+				return
+			}
+
+			require.NoError(t, err)
+			t.Cleanup(func() { entryPoint.Shutdown(t.Context()) })
+
+			assert.Equal(t, test.expectSize, entryPoint.http3Server.QUICConfig.InitialPacketSize)
+		})
+	}
+}
+
+func TestHTTP3Allow0RTT(t *testing.T) {
+	epConfig := &static.EntryPointsTransport{}
+	epConfig.SetDefaults()
+
+	for _, allow := range []bool{false, true} {
+		t.Run(fmt.Sprintf("allow0RTT=%t", allow), func(t *testing.T) {
+			t.Parallel()
+
+			entryPoint, err := NewTCPEntryPoint(t.Context(), "foo", &static.EntryPoint{
+				Address:          "127.0.0.1:0",
+				Transport:        epConfig,
+				ForwardedHeaders: &static.ForwardedHeaders{},
+				HTTP2:            &static.HTTP2Config{},
+				HTTP3: &static.HTTP3Config{
+					Allow0RTT: allow,
+				},
+			}, nil, nil)
+			require.NoError(t, err)
+			t.Cleanup(func() { entryPoint.Shutdown(t.Context()) })
+
+			assert.Equal(t, allow, entryPoint.http3Server.QUICConfig.Allow0RTT)
+		})
+	}
 }
 
 func TestHTTP3ReadTimeout(t *testing.T) {

@@ -721,3 +721,75 @@ func TestHTTP2Config(t *testing.T) {
 	assert.Equal(t, expectedEncoderTableSize, httpServer.HTTP2.MaxEncoderHeaderTableSize)
 	assert.Equal(t, expectedDecoderTableSize, httpServer.HTTP2.MaxDecoderHeaderTableSize)
 }
+
+func TestHTTP2ConfigBuffers(t *testing.T) {
+	expectedReadFrameSize := 1 << 20
+	expectedBufferPerConnection := 2 << 20
+	expectedBufferPerStream := 1 << 20
+
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	require.NoError(t, err)
+	t.Cleanup(func() {
+		_ = ln.Close()
+	})
+
+	configuration := &static.EntryPoint{}
+	configuration.SetDefaults()
+	configuration.HTTP2.MaxReadFrameSize = int32(expectedReadFrameSize)
+	configuration.HTTP2.MaxReceiveBufferPerConnection = int32(expectedBufferPerConnection)
+	configuration.HTTP2.MaxReceiveBufferPerStream = int32(expectedBufferPerStream)
+
+	server, err := newHTTPServer(t.Context(), ln, configuration, false, requestdecorator.New(nil))
+	require.NoError(t, err)
+
+	httpServer := server.Server.(*http.Server)
+
+	assert.Equal(t, expectedReadFrameSize, httpServer.HTTP2.MaxReadFrameSize)
+	assert.Equal(t, expectedBufferPerConnection, httpServer.HTTP2.MaxReceiveBufferPerConnection)
+	assert.Equal(t, expectedBufferPerStream, httpServer.HTTP2.MaxReceiveBufferPerStream)
+}
+
+// Left unset, the options must stay zero so that net/http applies its own
+// defaults rather than this endpoint imposing a smaller window.
+func TestHTTP2ConfigBuffersDefaultToZero(t *testing.T) {
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	require.NoError(t, err)
+	t.Cleanup(func() {
+		_ = ln.Close()
+	})
+
+	configuration := &static.EntryPoint{}
+	configuration.SetDefaults()
+
+	server, err := newHTTPServer(t.Context(), ln, configuration, false, requestdecorator.New(nil))
+	require.NoError(t, err)
+
+	httpServer := server.Server.(*http.Server)
+
+	assert.Zero(t, httpServer.HTTP2.MaxReadFrameSize)
+	assert.Zero(t, httpServer.HTTP2.MaxReceiveBufferPerConnection)
+	assert.Zero(t, httpServer.HTTP2.MaxReceiveBufferPerStream)
+}
+
+func TestHTTP2ConfigRejectsNegative(t *testing.T) {
+	for name, mutate := range map[string]func(*static.EntryPoint){
+		"read frame size":               func(e *static.EntryPoint) { e.HTTP2.MaxReadFrameSize = -1 },
+		"receive buffer per connection": func(e *static.EntryPoint) { e.HTTP2.MaxReceiveBufferPerConnection = -1 },
+		"receive buffer per stream":     func(e *static.EntryPoint) { e.HTTP2.MaxReceiveBufferPerStream = -1 },
+	} {
+		t.Run(name, func(t *testing.T) {
+			ln, err := net.Listen("tcp", "127.0.0.1:0")
+			require.NoError(t, err)
+			t.Cleanup(func() {
+				_ = ln.Close()
+			})
+
+			configuration := &static.EntryPoint{}
+			configuration.SetDefaults()
+			mutate(configuration)
+
+			_, err = newHTTPServer(t.Context(), ln, configuration, false, requestdecorator.New(nil))
+			assert.Error(t, err)
+		})
+	}
+}

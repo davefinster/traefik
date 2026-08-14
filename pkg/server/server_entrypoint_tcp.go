@@ -628,6 +628,15 @@ func newHTTPServer(ctx context.Context, ln net.Listener, configuration *static.E
 	if configuration.HTTP2.MaxEncoderHeaderTableSize < 0 {
 		return nil, errors.New("max encoder header table size value must be greater than or equal to zero")
 	}
+	if configuration.HTTP2.MaxReadFrameSize < 0 {
+		return nil, errors.New("max read frame size value must be greater than or equal to zero")
+	}
+	if configuration.HTTP2.MaxReceiveBufferPerConnection < 0 {
+		return nil, errors.New("max receive buffer per connection value must be greater than or equal to zero")
+	}
+	if configuration.HTTP2.MaxReceiveBufferPerStream < 0 {
+		return nil, errors.New("max receive buffer per stream value must be greater than or equal to zero")
+	}
 
 	httpSwitcher := middlewares.NewHandlerSwitcher(http.NotFoundHandler())
 
@@ -689,6 +698,11 @@ func newHTTPServer(ctx context.Context, ln net.Listener, configuration *static.E
 			MaxConcurrentStreams:      int(configuration.HTTP2.MaxConcurrentStreams),
 			MaxDecoderHeaderTableSize: int(configuration.HTTP2.MaxDecoderHeaderTableSize),
 			MaxEncoderHeaderTableSize: int(configuration.HTTP2.MaxEncoderHeaderTableSize),
+			// Left at zero these fall back to the net/http defaults, which is
+			// why they carry no SetDefaults entry.
+			MaxReadFrameSize:              int(configuration.HTTP2.MaxReadFrameSize),
+			MaxReceiveBufferPerConnection: int(configuration.HTTP2.MaxReceiveBufferPerConnection),
+			MaxReceiveBufferPerStream:     int(configuration.HTTP2.MaxReceiveBufferPerStream),
 		},
 	}
 	if debugConnection || (configuration.Transport != nil && (configuration.Transport.KeepAliveMaxTime > 0 || configuration.Transport.KeepAliveMaxRequests > 0)) {

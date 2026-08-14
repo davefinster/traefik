@@ -1,0 +1,133 @@
+name: Branch Release
+
+on:
+  push:
+    branches:
+      - http3-and-http2
+  workflow_dispatch: {}
+
+# A push that supersedes an in-flight run makes that run's artifacts stale.
+concurrency:
+  group: branch-release-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CGO_ENABLED: 0
+  CODENAME: cheddar
+  # Rolling tag: recreated at the head commit on every push.
+  RELEASE_TAG: http3-and-http2-latest
+
+jobs:
+
+  build-webui:
+    if: github.repository == 'davefinster/traefik'
+    uses: ./.github/workflows/template-webui.yaml
+
+  build:
+    if: github.repository == 'davefinster/traefik'
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    strategy:
+      matrix:
+        arch: [ amd64, arm64 ]
+    needs:
+      - build-webui
+
+    steps:
+      - name: Check out code
+        uses: actions/checkout@8e8c483db84b4bee98b60c0593521ed34d9990e8 # v6.0.1
+        with:
+          fetch-depth: 0
+
+      - name: Set up Go
+        uses: actions/setup-go@7a3fe6cf4cb3a834922a1244abfce67bcef6a0c5 # v6.2.0
+        env:
+          # Ensure cache consistency on Linux, see https://github.com/actions/setup-go/pull/383
+          ImageOS: linux-${{ matrix.arch }}
+        with:
+          go-version-file: '.go-version'
+          check-latest: true
+
+      - name: Artifact webui
+        uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7.0.0
+        with:
+          name: webui.tar.gz
+
+      - name: Untar webui
+        run: |
+          tar xvf webui.tar.gz
+          rm webui.tar.gz
+
+      - name: Compute version
+        run: echo "VERSION=${GITHUB_REF_NAME}-$(git rev-parse --short HEAD)" >> "$GITHUB_ENV"
+
+      - name: Build binary
+        env:
+          GOOS: linux
+          GOARCH: ${{ matrix.arch }}
+        run: make binary
+
+      - name: Package tar.gz
+        run: |
+          mkdir -p release
+          cp LICENSE.md CHANGELOG.md "dist/linux/${{ matrix.arch }}/"
+          tar czf "release/traefik_${VERSION}_linux_${{ matrix.arch }}.tar.gz" \
+            -C "dist/linux/${{ matrix.arch }}" traefik LICENSE.md CHANGELOG.md
+          cd release
+          sha256sum "traefik_${VERSION}_linux_${{ matrix.arch }}.tar.gz" > "linux-${{ matrix.arch }}_checksums.txt"
+
+      - name: Artifact binaries
+        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6.0.0
+        with:
+          name: linux-${{ matrix.arch }}-binaries
+          path: |
+            release/*.tar.gz
+            release/*_checksums.txt
+          retention-days: 7
+
+  release:
+    if: github.repository == 'davefinster/traefik'
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    permissions:
+      contents: write
+
+    needs:
+      - build
+
+    steps:
+      - name: Check out code
+        uses: actions/checkout@8e8c483db84b4bee98b60c0593521ed34d9990e8 # v6.0.1
+        with:
+          fetch-depth: 0
+
+      - name: Download all artifacts
+        uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7.0.0
+        with:
+          path: release/
+          pattern: "*-binaries"
+          merge-multiple: true
+
+      - name: Publish rolling prerelease
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          VERSION="${GITHUB_REF_NAME}-$(git rev-parse --short HEAD)"
+
+          cat release/*_checksums.txt > "release/traefik_${VERSION}_checksums.txt"
+          rm release/linux-*_checksums.txt
+
+          # Drop the previous rolling release and its tag so the new one points at HEAD.
+          gh release delete "${RELEASE_TAG}" --yes --cleanup-tag || true
+          # Covers a leftover tag with no release attached, which would pin the new release to the old commit.
+          git push origin ":refs/tags/${RELEASE_TAG}" || true
+
+          gh release create "${RELEASE_TAG}" \
+            release/traefik_*.tar.gz "release/traefik_${VERSION}_checksums.txt" \
+            --target "${GITHUB_SHA}" \
+            --title "${VERSION}" \
+            --notes "Development build of \`${GITHUB_REF_NAME}\` at ${GITHUB_SHA}." \
+            --prerelease \
+            --latest=false

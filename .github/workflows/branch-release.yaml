@@ -4,6 +4,7 @@ on:
   push:
     branches:
       - http3-and-http2
+      - tsnet-backends
   workflow_dispatch: {}
 
 # A push that supersedes an in-flight run makes that run's artifacts stale.
@@ -14,8 +15,8 @@ concurrency:
 env:
   CGO_ENABLED: 0
   CODENAME: cheddar
-  # Rolling tag: recreated at the head commit on every push.
-  RELEASE_TAG: http3-and-http2-latest
+  # Rolling tag per branch: recreated at the head commit on every push.
+  RELEASE_TAG: ${{ github.ref_name }}-latest
 
 jobs:
 

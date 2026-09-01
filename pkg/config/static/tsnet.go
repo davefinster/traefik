@@ -28,4 +28,8 @@ type TsnetTailnet struct {
 	// Ephemeral registers the node as ephemeral: it is removed from the
 	// tailnet after going offline.
 	Ephemeral bool `description:"Register the node as ephemeral." json:"ephemeral,omitempty" toml:"ephemeral,omitempty" yaml:"ephemeral,omitempty" export:"true"`
+	// AdvertiseTags are the tags the node advertises (tag:...). Required
+	// when the auth key is an OAuth client secret: Tailscale refuses such a
+	// join without explicit tags ("oauth authkeys require --advertise-tags").
+	AdvertiseTags []string `description:"Tags advertised by the node (tag:...); required with an OAuth-client-secret auth key." json:"advertiseTags,omitempty" toml:"advertiseTags,omitempty" yaml:"advertiseTags,omitempty" export:"true"`
 }

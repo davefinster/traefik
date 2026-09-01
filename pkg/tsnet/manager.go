@@ -59,11 +59,12 @@ func NewManager(cfg *static.TsnetConfig) (*Manager, error) {
 
 		logger := log.With().Str("tailnet", name).Logger()
 		srv := &tailscaletsnet.Server{
-			Hostname:   tn.Hostname,
-			Dir:        tn.StateDir,
-			AuthKey:    tn.AuthKey,
-			ControlURL: tn.ControlURL,
-			Ephemeral:  tn.Ephemeral,
+			Hostname:      tn.Hostname,
+			Dir:           tn.StateDir,
+			AuthKey:       tn.AuthKey,
+			ControlURL:    tn.ControlURL,
+			Ephemeral:     tn.Ephemeral,
+			AdvertiseTags: tn.AdvertiseTags,
 			UserLogf: func(format string, args ...any) {
 				logger.Info().Msgf(format, args...)
 			},

@@ -190,6 +190,7 @@ type TCPServersTransport struct {
 	// means an infinite deadline (i.e. the reading capability is never closed).
 	TerminationDelay ptypes.Duration  `description:"Defines the delay to wait before fully terminating the connection, after one connected peer has closed its writing capability." json:"terminationDelay,omitempty" toml:"terminationDelay,omitempty" yaml:"terminationDelay,omitempty" export:"true"`
 	TLS              *TLSClientConfig `description:"Defines the TLS configuration." json:"tls,omitempty" toml:"tls,omitempty" yaml:"tls,omitempty" label:"allowEmpty" file:"allowEmpty" kv:"allowEmpty" export:"true"`
+	Tailnet          string           `description:"Dials the backend servers over the named tsnet tailnet from the static configuration instead of the host network." json:"tailnet,omitempty" toml:"tailnet,omitempty" yaml:"tailnet,omitempty" export:"true"`
 }
 
 // SetDefaults sets the default values for a TCPServersTransport.

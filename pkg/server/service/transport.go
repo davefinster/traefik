@@ -24,6 +24,14 @@ import (
 	"github.com/traefik/traefik/v3/pkg/types"
 )
 
+// TailnetDialer dials over a named tsnet tailnet (implemented by
+// pkg/tsnet.Manager, which cannot be imported here: it depends on the static
+// configuration, whose dependency tree loops back into this package).
+type TailnetDialer interface {
+	DialContext(ctx context.Context, tailnet, network, addr string) (net.Conn, error)
+	Has(tailnet string) bool
+}
+
 // SpiffeX509Source allows to retrieve a x509 SVID and bundle.
 type SpiffeX509Source interface {
 	x509svid.Source
@@ -38,6 +46,7 @@ type TransportManager struct {
 	tlsConfigs    map[string]*tls.Config
 
 	spiffeX509Source SpiffeX509Source
+	tailnetDialer    TailnetDialer
 }
 
 // NewTransportManager creates a new TransportManager.
@@ -48,6 +57,13 @@ func NewTransportManager(spiffeX509Source SpiffeX509Source) *TransportManager {
 		tlsConfigs:       make(map[string]*tls.Config),
 		spiffeX509Source: spiffeX509Source,
 	}
+}
+
+// SetTailnetDialer sets the tsnet manager transports with a tailnet dial
+// through. Must be called before the first Update; a nil manager is valid
+// (every tailnet dial then fails with a configuration error).
+func (t *TransportManager) SetTailnetDialer(m TailnetDialer) {
+	t.tailnetDialer = m
 }
 
 // Update updates the transport configurations.
@@ -270,9 +286,27 @@ func (c connWithTimeouts) Write(b []byte) (n int, err error) {
 	return n, nil
 }
 
-func customDialContext(d *net.Dialer, cfg *dynamic.ForwardingTimeouts) func(ctx context.Context, network string, address string) (net.Conn, error) {
+type dialContextFunc func(ctx context.Context, network, address string) (net.Conn, error)
+
+// tailnetDialContext adapts a tailnet dial to a plain dialContext, applying
+// the dial timeout net.Dialer would otherwise own.
+func tailnetDialContext(dialer TailnetDialer, tailnet string, timeout time.Duration) dialContextFunc {
 	return func(ctx context.Context, network, address string) (net.Conn, error) {
-		conn, err := d.DialContext(ctx, network, address)
+		if dialer == nil {
+			return nil, fmt.Errorf("dialing %q over tailnet %q: no tsnet tailnets configured", address, tailnet)
+		}
+		if timeout > 0 {
+			var cancel context.CancelFunc
+			ctx, cancel = context.WithTimeout(ctx, timeout)
+			defer cancel()
+		}
+		return dialer.DialContext(ctx, tailnet, network, address)
+	}
+}
+
+func customDialContext(dial dialContextFunc, cfg *dynamic.ForwardingTimeouts) dialContextFunc {
+	return func(ctx context.Context, network, address string) (net.Conn, error) {
+		conn, err := dial(ctx, network, address)
 
 		if cfg.ReadTimeout <= 0 && cfg.WriteTimeout <= 0 {
 			return conn, err
@@ -305,9 +339,20 @@ func (t *TransportManager) createRoundTripper(cfg *dynamic.ServersTransport, tls
 		dialer.Timeout = time.Duration(cfg.ForwardingTimeouts.DialTimeout)
 	}
 
+	dialContext := dialContextFunc(dialer.DialContext)
+	if cfg.Tailnet != "" {
+		// A dial through an unknown or unconfigured tailnet fails on use
+		// rather than at build time: falling back to the default transport
+		// here would silently dial over the host network instead.
+		if t.tailnetDialer == nil || !t.tailnetDialer.Has(cfg.Tailnet) {
+			log.Warn().Msgf("ServersTransport references tsnet tailnet %q which is not in the static configuration; requests through it will fail", cfg.Tailnet)
+		}
+		dialContext = tailnetDialContext(t.tailnetDialer, cfg.Tailnet, dialer.Timeout)
+	}
+
 	transport := &http.Transport{
 		Proxy:                 http.ProxyFromEnvironment,
-		DialContext:           dialer.DialContext,
+		DialContext:           dialContext,
 		MaxIdleConnsPerHost:   cfg.MaxIdleConnsPerHost,
 		IdleConnTimeout:       90 * time.Second,
 		TLSHandshakeTimeout:   10 * time.Second,
@@ -320,7 +365,7 @@ func (t *TransportManager) createRoundTripper(cfg *dynamic.ServersTransport, tls
 	if cfg.ForwardingTimeouts != nil {
 		transport.ResponseHeaderTimeout = time.Duration(cfg.ForwardingTimeouts.ResponseHeaderTimeout)
 		transport.IdleConnTimeout = time.Duration(cfg.ForwardingTimeouts.IdleConnTimeout)
-		transport.DialContext = customDialContext(dialer, cfg.ForwardingTimeouts)
+		transport.DialContext = customDialContext(dialContext, cfg.ForwardingTimeouts)
 	}
 
 	// Return directly HTTP/1.1 transport when HTTP/2 is disabled

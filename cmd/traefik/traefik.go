@@ -48,6 +48,7 @@ import (
 	"github.com/traefik/traefik/v3/pkg/server/service"
 	"github.com/traefik/traefik/v3/pkg/tcp"
 	traefiktls "github.com/traefik/traefik/v3/pkg/tls"
+	"github.com/traefik/traefik/v3/pkg/tsnet"
 	"github.com/traefik/traefik/v3/pkg/version"
 )
 
@@ -294,7 +295,13 @@ func setupServer(staticConfiguration *static.Configuration) (*server.Server, err
 		log.Info().Msg("Successfully obtained SPIFFE SVID.")
 	}
 
+	tsnetManager, err := tsnet.NewManager(staticConfiguration.Tsnet)
+	if err != nil {
+		return nil, fmt.Errorf("creating tsnet manager: %w", err)
+	}
+
 	transportManager := service.NewTransportManager(spiffeX509Source)
+	transportManager.SetTailnetDialer(tsnetManager)
 
 	var proxyBuilder service.ProxyBuilder = httputil.NewProxyBuilder(transportManager, semConvMetricRegistry)
 	if staticConfiguration.Experimental != nil && staticConfiguration.Experimental.FastProxy != nil {
@@ -302,6 +309,7 @@ func setupServer(staticConfiguration *static.Configuration) (*server.Server, err
 	}
 
 	dialerManager := tcp.NewDialerManager(spiffeX509Source)
+	dialerManager.SetTailnetDialer(tsnetManager)
 	acmeHTTPHandler := getHTTPChallengeHandler(acmeProviders, httpChallengeProvider)
 	managerFactory := service.NewManagerFactory(*staticConfiguration, routinesPool, observabilityMgr, transportManager, proxyBuilder, acmeHTTPHandler, tlsManager)
 

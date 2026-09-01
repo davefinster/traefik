@@ -110,6 +110,8 @@ type Configuration struct {
 
 	Spiffe *SpiffeClientConfig `description:"SPIFFE integration configuration." json:"spiffe,omitempty" toml:"spiffe,omitempty" yaml:"spiffe,omitempty" export:"true"`
 
+	Tsnet *TsnetConfig `description:"Embedded Tailscale (tsnet) nodes for dialing backends over tailnets." json:"tsnet,omitempty" toml:"tsnet,omitempty" yaml:"tsnet,omitempty" export:"true"`
+
 	OCSP *tls.OCSPConfig `description:"OCSP configuration." json:"ocsp,omitempty" toml:"ocsp,omitempty" yaml:"ocsp,omitempty" label:"allowEmpty" file:"allowEmpty" export:"true"`
 }
 

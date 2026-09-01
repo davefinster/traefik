@@ -46,8 +46,12 @@ func TestManagerUnknownTailnet(t *testing.T) {
 	assert.ErrorContains(t, err, `unknown tsnet tailnet "homelab"`)
 }
 
-func TestManagerReadsAuthKeyFile(t *testing.T) {
-	_, err := NewManager(&static.TsnetConfig{
+func TestManagerMissingAuthKeyFileFailsDialNotBoot(t *testing.T) {
+	// The file is often delivered by an external system after the proxy is
+	// already up: its absence must degrade that tailnet's dials, never keep
+	// the manager from being built (2026-09-01: an eager read at construction
+	// refused to start the whole edge over one undelivered file).
+	m, err := NewManager(&static.TsnetConfig{
 		Tailnets: map[string]*static.TsnetTailnet{
 			"global-infrastructure": {
 				StateDir:    t.TempDir(),
@@ -55,5 +59,14 @@ func TestManagerReadsAuthKeyFile(t *testing.T) {
 			},
 		},
 	})
+	require.NoError(t, err)
+	t.Cleanup(m.Close)
+
+	_, err = m.DialContext(context.Background(), "global-infrastructure", "tcp", "host:80")
+	require.ErrorContains(t, err, "reading authKeyFile")
+
+	// The failed read must not have started (and so frozen) the server:
+	// the next dial retries the file.
+	_, err = m.DialContext(context.Background(), "global-infrastructure", "tcp", "host:80")
 	require.ErrorContains(t, err, "reading authKeyFile")
 }

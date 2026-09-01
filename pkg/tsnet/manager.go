@@ -22,6 +22,13 @@ import (
 type Manager struct {
 	mu      sync.Mutex
 	servers map[string]*tailscaletsnet.Server
+	// authKeyFiles holds each tailnet's authKeyFile path, read lazily at the
+	// first dial rather than at construction: the file is often delivered by
+	// an external system (a mounted config store), and its absence must
+	// degrade that tailnet's dials, never keep the whole proxy from booting.
+	// (2026-09-01: an eager read here refused to start the edge and took
+	// every route down over one undelivered file.)
+	authKeyFiles map[string]string
 	// started tracks the servers a dial has touched: tsnet starts a server
 	// on its first Dial, and closing a never-started server panics.
 	started map[string]bool
@@ -36,8 +43,9 @@ func NewManager(cfg *static.TsnetConfig) (*Manager, error) {
 	}
 
 	m := &Manager{
-		servers: make(map[string]*tailscaletsnet.Server),
-		started: make(map[string]bool),
+		servers:      make(map[string]*tailscaletsnet.Server),
+		authKeyFiles: make(map[string]string),
+		started:      make(map[string]bool),
 	}
 	for name, tn := range cfg.Tailnets {
 		if tn == nil {
@@ -49,20 +57,11 @@ func NewManager(cfg *static.TsnetConfig) (*Manager, error) {
 			return nil, fmt.Errorf("tsnet tailnet %q: stateDir is required", name)
 		}
 
-		authKey := tn.AuthKey
-		if tn.AuthKeyFile != "" {
-			content, err := os.ReadFile(tn.AuthKeyFile)
-			if err != nil {
-				return nil, fmt.Errorf("tsnet tailnet %q: reading authKeyFile: %w", name, err)
-			}
-			authKey = strings.TrimSpace(string(content))
-		}
-
 		logger := log.With().Str("tailnet", name).Logger()
 		srv := &tailscaletsnet.Server{
 			Hostname:   tn.Hostname,
 			Dir:        tn.StateDir,
-			AuthKey:    authKey,
+			AuthKey:    tn.AuthKey,
 			ControlURL: tn.ControlURL,
 			Ephemeral:  tn.Ephemeral,
 			UserLogf: func(format string, args ...any) {
@@ -73,6 +72,9 @@ func NewManager(cfg *static.TsnetConfig) (*Manager, error) {
 			},
 		}
 		m.servers[name] = srv
+		if tn.AuthKeyFile != "" {
+			m.authKeyFiles[name] = tn.AuthKeyFile
+		}
 	}
 
 	return m, nil
@@ -89,6 +91,18 @@ func (m *Manager) DialContext(ctx context.Context, tailnet, network, addr string
 	m.mu.Lock()
 	srv, ok := m.servers[tailnet]
 	if ok {
+		// The auth key file resolves here, not at construction, so an
+		// undelivered file fails this dial and heals on the next one. It
+		// must resolve before the server is marked started: the first Dial
+		// freezes the server's configuration.
+		if file, pending := m.authKeyFiles[tailnet]; pending && !m.started[tailnet] {
+			content, err := os.ReadFile(file)
+			if err != nil {
+				m.mu.Unlock()
+				return nil, fmt.Errorf("dialing %q over tailnet %q: reading authKeyFile: %w", addr, tailnet, err)
+			}
+			srv.AuthKey = strings.TrimSpace(string(content))
+		}
 		// Before the dial: even a failed dial attempt starts the server.
 		m.started[tailnet] = true
 	}

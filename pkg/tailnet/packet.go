@@ -70,7 +70,7 @@ func (n *Node) RetryListenPacketAll(ctx context.Context, network, addr string, d
 			return conns, nil
 		}
 
-		logger.Warn().Err(err).Dur("retryIn", interval).Msg("Cannot listen for packets on tailnet yet, retrying")
+		logger.Warn().Err(err).Str("retryIn", interval.String()).Msg("Cannot listen for packets on tailnet yet, retrying")
 
 		select {
 		case <-time.After(interval):

@@ -106,7 +106,7 @@ func (l *lazyListener) listener() (net.Listener, error) {
 			return nil, net.ErrClosed
 		}
 
-		logger.Warn().Err(err).Dur("retryIn", interval).Msg("Cannot listen on tailnet yet, retrying")
+		logger.Warn().Err(err).Str("retryIn", interval.String()).Msg("Cannot listen on tailnet yet, retrying")
 
 		select {
 		case <-time.After(interval):

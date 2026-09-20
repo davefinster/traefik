@@ -22,16 +22,28 @@ import (
 	"os"
 	"strings"
 	"sync"
+	"time"
 
+	"github.com/pires/go-proxyproto"
 	"github.com/rs/zerolog/log"
 	"github.com/traefik/traefik/v3/pkg/config/static"
 	// Registers support for OAuth client secrets (tskey-client-...) as auth
 	// keys. Without it, tsnet would send the client secret to the control
 	// plane as though it were an auth key, and the join would be rejected.
 	_ "tailscale.com/feature/oauthkey"
+	"tailscale.com/ipn"
 	"tailscale.com/ipn/ipnstate"
+	"tailscale.com/tailcfg"
 	"tailscale.com/tsnet"
 )
+
+// servicePrefix is the prefix every Tailscale Service name carries; tailcfg
+// validates against it but exports no constant for it.
+const servicePrefix = "svc:"
+
+// advertiseTimeout bounds the local API calls that publish routes and
+// Services, so a wedged backend surfaces as a retry rather than a hang.
+const advertiseTimeout = 30 * time.Second
 
 // ErrNoTailnets is returned for any operation naming a tailnet when none are
 // configured at all, which is a likelier mistake than a mistyped name.
@@ -42,6 +54,9 @@ var ErrNoTailnets = errors.New("no tailnets configured")
 // refuses every operation, so callers need no configured-or-not checks.
 type Registry struct {
 	nodes map[string]*Node
+
+	stopOnce sync.Once
+	stop     chan struct{}
 }
 
 // NewRegistry validates the tailnet configuration and prepares a node for
@@ -52,7 +67,7 @@ func NewRegistry(cfg map[string]*static.Tailnet) (*Registry, error) {
 		return nil, nil
 	}
 
-	r := &Registry{nodes: make(map[string]*Node, len(cfg))}
+	r := &Registry{nodes: make(map[string]*Node, len(cfg)), stop: make(chan struct{})}
 	for name, tn := range cfg {
 		if tn == nil {
 			return nil, fmt.Errorf("tailnet %q: missing configuration", name)
@@ -66,10 +81,92 @@ func NewRegistry(cfg map[string]*static.Tailnet) (*Registry, error) {
 			return nil, fmt.Errorf("tailnet %q: authKey and authKeyFile are mutually exclusive", name)
 		}
 
-		r.nodes[name] = &Node{name: name, cfg: tn}
+		routes, err := parseRoutes(tn.Routes)
+		if err != nil {
+			return nil, fmt.Errorf("tailnet %q: %w", name, err)
+		}
+
+		services, err := parseServices(tn.Services)
+		if err != nil {
+			return nil, fmt.Errorf("tailnet %q: %w", name, err)
+		}
+
+		// Hosting a Service requires a tagged node, and an untagged one is
+		// refused by the control plane rather than by us, on the first
+		// listen. Catching it here names the configuration that is wrong.
+		if len(services) > 0 && len(tn.AdvertiseTags) == 0 {
+			return nil, fmt.Errorf("tailnet %q: hosting a Tailscale Service requires advertiseTags: only tagged nodes may host one", name)
+		}
+
+		r.nodes[name] = &Node{name: name, cfg: tn, routes: routes, services: services}
 	}
 
 	return r, nil
+}
+
+// parseRoutes turns the configured CIDR prefixes into the form the tailnet
+// preferences take, rejecting a malformed one at startup rather than on the
+// first join.
+func parseRoutes(routes []string) ([]netip.Prefix, error) {
+	if len(routes) == 0 {
+		return nil, nil
+	}
+
+	parsed := make([]netip.Prefix, 0, len(routes))
+	for _, route := range routes {
+		prefix, err := netip.ParsePrefix(route)
+		if err != nil {
+			return nil, fmt.Errorf("parsing route %q: %w", route, err)
+		}
+		// A prefix carrying host bits is rejected by the control plane, and
+		// silently masking it would advertise something other than what was
+		// written.
+		if prefix.Masked() != prefix {
+			return nil, fmt.Errorf("route %q has bits set beyond its prefix length, did you mean %q?", route, prefix.Masked())
+		}
+		parsed = append(parsed, prefix)
+	}
+
+	return parsed, nil
+}
+
+// parseServices resolves each Service's name and validates it, so that a
+// typo is a startup error rather than a Service that never comes up.
+func parseServices(services map[string]*static.TailnetService) (map[string]*service, error) {
+	if len(services) == 0 {
+		return nil, nil
+	}
+
+	parsed := make(map[string]*service, len(services))
+	for key, cfg := range services {
+		if cfg == nil {
+			return nil, fmt.Errorf("service %q: missing configuration", key)
+		}
+
+		name := cfg.Name
+		if name == "" {
+			name = servicePrefix + key
+		}
+
+		svcName := tailcfg.ServiceName(name)
+		if err := svcName.Validate(); err != nil {
+			return nil, fmt.Errorf("service %q: invalid name %q: %w", key, name, err)
+		}
+
+		if cfg.ProxyProtocol < 0 || cfg.ProxyProtocol > 2 {
+			return nil, fmt.Errorf("service %q: proxyProtocol must be 0, 1 or 2, got %d", key, cfg.ProxyProtocol)
+		}
+
+		parsed[key] = &service{name: svcName, cfg: cfg}
+	}
+
+	return parsed, nil
+}
+
+// service is one configured Tailscale Service, with its name resolved.
+type service struct {
+	name tailcfg.ServiceName
+	cfg  *static.TailnetService
 }
 
 // Node returns the node for the named tailnet.
@@ -104,11 +201,35 @@ func (r *Registry) DialContext(ctx context.Context, tailnet, network, addr strin
 	return node.DialContext(ctx, network, addr)
 }
 
+// Start joins the nodes that have something to publish before anything asks
+// them for a listener or a dial. A node advertising routes is the case that
+// matters: the routes exist only while it is joined, so waiting for an
+// entryPoint that may never reference it would leave them unadvertised.
+//
+// It does not block. Each node joins in the background and retries, so a
+// tailnet that is not up yet costs nothing at startup.
+func (r *Registry) Start(ctx context.Context) {
+	if r == nil {
+		return
+	}
+
+	for _, node := range r.nodes {
+		if len(node.routes) == 0 {
+			continue
+		}
+
+		go node.joinAndRetry(ctx, r.stop)
+	}
+}
+
 // Close shuts down every node that was started.
 func (r *Registry) Close() {
 	if r == nil {
 		return
 	}
+
+	r.stopOnce.Do(func() { close(r.stop) })
+
 	for _, node := range r.nodes {
 		node.Close()
 	}
@@ -119,8 +240,10 @@ func (r *Registry) Close() {
 // failed start forever on the server it happened to: retrying has to happen
 // on a fresh one.
 type Node struct {
-	name string
-	cfg  *static.Tailnet
+	name     string
+	cfg      *static.Tailnet
+	routes   []netip.Prefix
+	services map[string]*service
 
 	// startMu serializes join attempts. It is deliberately not n.mu:
 	// tsnet.Server.Start takes no context and can block for as long as the
@@ -153,6 +276,64 @@ func (n *Node) Listen(network, addr string) (net.Listener, error) {
 		return nil, err
 	}
 	return srv.Listen(network, addr)
+}
+
+// HasService reports whether the named Tailscale Service is configured on
+// this tailnet, letting an entryPoint fail on a typo at startup.
+func (n *Node) HasService(name string) bool {
+	_, ok := n.services[name]
+	return ok
+}
+
+// ListenService announces the named Tailscale Service on the given port and
+// returns a listener for it. Hosting a Service advertises it from this node,
+// which the tailnet must still approve, and requires the node to be tagged.
+//
+// The returned listener is a local socket that Tailscale forwards the
+// Service's traffic to, so its connections come from the loopback address
+// rather than from the peer. With the Service's PROXY protocol enabled, the
+// listener parses the header Tailscale sends and reports the peer's real
+// address, which is what keeps access logs and IP allow-lists meaningful.
+func (n *Node) ListenService(name string, port uint16) (net.Listener, error) {
+	svc, ok := n.services[name]
+	if !ok {
+		return nil, fmt.Errorf("tailnet %q: unknown Service %q", n.name, name)
+	}
+
+	srv, err := n.server()
+	if err != nil {
+		return nil, err
+	}
+
+	listener, err := srv.ListenService(svc.name.String(), tsnet.ServiceModeTCP{
+		Port:                 port,
+		TerminateTLS:         svc.cfg.TerminateTLS,
+		PROXYProtocolVersion: svc.cfg.ProxyProtocol,
+	})
+	if err != nil {
+		return nil, fmt.Errorf("tailnet %q: hosting Service %q: %w", n.name, svc.name, err)
+	}
+
+	log.Info().
+		Str("tailnet", n.name).
+		Str("service", svc.name.String()).
+		Str("fqdn", listener.FQDN).
+		Uint16("port", port).
+		Msg("Hosting Tailscale Service")
+
+	if svc.cfg.ProxyProtocol == 0 {
+		return listener, nil
+	}
+
+	// Tailscale forwards over loopback, so the header it writes is the only
+	// account of who the peer was. Trusting it unconditionally is safe here
+	// precisely because nothing else can reach this socket.
+	return &proxyproto.Listener{
+		Listener: listener,
+		Policy: func(net.Addr) (proxyproto.Policy, error) {
+			return proxyproto.REQUIRE, nil
+		},
+	}, nil
 }
 
 // ListenPacket announces a packet conn on the tailnet.
@@ -246,6 +427,16 @@ func (n *Node) server() (*tsnet.Server, error) {
 		return nil, fmt.Errorf("tailnet %q: joining: %w", n.name, err)
 	}
 
+	// Routes are advertised through the preferences, which tsnet does not
+	// carry on its Server, so they are applied once the node has joined. A
+	// failure here drops the server so the next attempt is a clean retry:
+	// keeping a node that advertises nothing it was told to would be a
+	// tailnet that looks healthy and routes nothing.
+	if err := n.advertiseRoutes(srv); err != nil {
+		_ = srv.Close()
+		return nil, err
+	}
+
 	n.mu.Lock()
 	if n.closed {
 		n.mu.Unlock()
@@ -306,4 +497,75 @@ func (n *Node) build() (*tsnet.Server, error) {
 			logger.Trace().Msgf(format, args...)
 		},
 	}, nil
+}
+
+// advertiseRoutes sets the node's advertised routes to exactly what the
+// configuration names. It is a no-op when none are configured, so a node
+// that never advertised any is not made to talk to its local API.
+func (n *Node) advertiseRoutes(srv *tsnet.Server) error {
+	if len(n.routes) == 0 {
+		return nil
+	}
+
+	client, err := srv.LocalClient()
+	if err != nil {
+		return fmt.Errorf("tailnet %q: local client: %w", n.name, err)
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), advertiseTimeout)
+	defer cancel()
+
+	if _, err := client.EditPrefs(ctx, &ipn.MaskedPrefs{
+		AdvertiseRoutesSet: true,
+		Prefs:              ipn.Prefs{AdvertiseRoutes: n.routes},
+	}); err != nil {
+		return fmt.Errorf("tailnet %q: advertising routes: %w", n.name, err)
+	}
+
+	log.Info().
+		Str("tailnet", n.name).
+		Strs("routes", n.cfg.Routes).
+		Msg("Advertised routes into the tailnet; they serve traffic only where an entryPoint binds the address, and need approval in the tailnet's ACLs")
+
+	return nil
+}
+
+// joinAndRetry brings the node up, retrying with a capped backoff until it
+// succeeds, the registry stops, or the context is done.
+func (n *Node) joinAndRetry(ctx context.Context, stop <-chan struct{}) {
+	logger := log.Ctx(ctx).With().Str("tailnet", n.name).Logger()
+
+	for interval := retryInitialInterval; ; interval = min(interval*2, retryMaxInterval) {
+		joined := make(chan error, 1)
+		// tsnet's join takes no context, so it is abandoned rather than
+		// canceled; the node itself releases what it built when closed.
+		go func() {
+			_, err := n.server()
+			joined <- err
+		}()
+
+		select {
+		case err := <-joined:
+			if err == nil {
+				return
+			}
+			// A closed node is not coming back.
+			if errors.Is(err, net.ErrClosed) {
+				return
+			}
+			logger.Warn().Err(err).Str("retryIn", interval.String()).Msg("Cannot join tailnet yet, retrying")
+		case <-stop:
+			return
+		case <-ctx.Done():
+			return
+		}
+
+		select {
+		case <-time.After(interval):
+		case <-stop:
+			return
+		case <-ctx.Done():
+			return
+		}
+	}
 }

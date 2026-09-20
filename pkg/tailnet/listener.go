@@ -3,6 +3,7 @@ package tailnet
 import (
 	"context"
 	"errors"
+	"fmt"
 	"net"
 	"sync"
 	"time"
@@ -26,19 +27,34 @@ const (
 // restart once the tailnet answers.
 func (n *Node) LazyListen(ctx context.Context, network, addr string) net.Listener {
 	return &lazyListener{
-		node:    n,
-		network: network,
-		addr:    addr,
-		ctx:     ctx,
-		done:    make(chan struct{}),
+		node: n,
+		bind: func() (net.Listener, error) { return n.Listen(network, addr) },
+		addr: pendingAddr{network: network, addr: addr},
+		ctx:  ctx,
+		done: make(chan struct{}),
+	}
+}
+
+// LazyListenService is LazyListen for a Tailscale Service. Hosting a Service
+// needs more of the tailnet than a plain listener does: the node must have
+// joined, be tagged, and have its advertisement accepted. All of that is
+// waited out on the retry rather than at startup, for the same reason.
+func (n *Node) LazyListenService(ctx context.Context, name string, port uint16) net.Listener {
+	return &lazyListener{
+		node: n,
+		bind: func() (net.Listener, error) { return n.ListenService(name, port) },
+		addr: pendingAddr{network: "tcp", addr: fmt.Sprintf("%s:%d", name, port)},
+		ctx:  ctx,
+		done: make(chan struct{}),
 	}
 }
 
 type lazyListener struct {
-	node    *Node
-	network string
-	addr    string
-	ctx     context.Context
+	node *Node
+	bind func() (net.Listener, error)
+	// addr stands in for the listener's address until it has one.
+	addr net.Addr
+	ctx  context.Context
 
 	mu     sync.Mutex
 	ln     net.Listener
@@ -83,7 +99,7 @@ func (l *lazyListener) Addr() net.Addr {
 	if l.ln != nil {
 		return l.ln.Addr()
 	}
-	return pendingAddr{network: l.network, addr: l.addr}
+	return l.addr
 }
 
 // listener returns the bound tailnet listener, binding it on first call and
@@ -110,7 +126,7 @@ func (l *lazyListener) listener() (net.Listener, error) {
 		// be able to abandon the attempt, and the goroutine hands over or
 		// releases whatever it eventually binds.
 		bound := make(chan error, 1)
-		go func() { bound <- l.bind() }()
+		go func() { bound <- l.tryBind() }()
 
 		var err error
 		select {
@@ -153,8 +169,8 @@ func (l *lazyListener) listener() (net.Listener, error) {
 // success. It closes what it bound if the lazyListener was closed meanwhile,
 // or if another attempt got there first, so an abandoned attempt leaks
 // nothing.
-func (l *lazyListener) bind() error {
-	ln, err := l.node.Listen(l.network, l.addr)
+func (l *lazyListener) tryBind() error {
+	ln, err := l.bind()
 	if err != nil {
 		return err
 	}

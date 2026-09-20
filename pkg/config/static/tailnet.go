@@ -50,7 +50,54 @@ type Tailnet struct {
 	// Zero picks one automatically, which is what most deployments want;
 	// pin it when a firewall has to be opened for direct connections.
 	Port uint16 `description:"Local UDP port for WireGuard traffic. Zero selects one automatically." json:"port,omitempty" toml:"port,omitempty" yaml:"port,omitempty" export:"true"`
+
+	// Routes are CIDR prefixes the node advertises into the tailnet, subject
+	// to approval by an admin or an ACL auto-approver.
+	//
+	// The node answers for an advertised address only where an entryPoint
+	// binds it: this gives Traefik additional addresses on the tailnet, and
+	// is not a subnet router. Traffic to an advertised address that no
+	// entryPoint binds is dropped.
+	Routes []string `description:"CIDR prefixes advertised into the tailnet. Traefik answers only on the addresses its entryPoints bind." json:"routes,omitempty" toml:"routes,omitempty" yaml:"routes,omitempty" export:"true"`
+
+	// Services are the Tailscale Services this node can host, keyed by the
+	// name entryPoints reference them as.
+	Services map[string]*TailnetService `description:"Tailscale Services this node can host, by the name entryPoints reference them as." json:"services,omitempty" toml:"services,omitempty" yaml:"services,omitempty" export:"true"`
 }
 
 // SetDefaults sets the default values.
 func (t *Tailnet) SetDefaults() {}
+
+// TailnetService is one Tailscale Service hosted by a tailnet node. An
+// entryPoint referencing it accepts that Service's traffic instead of
+// traffic addressed to the node itself, so the Service's name and virtual
+// IPs are what clients reach rather than this particular node.
+//
+// Hosting a Service requires the node to be tagged (see AdvertiseTags), and
+// the advertisement to be approved by an admin or an ACL auto-approver.
+type TailnetService struct {
+	// Name is the Tailscale Service name, which must start with "svc:".
+	// Defaults to "svc:" followed by the key this Service is configured
+	// under.
+	Name string `description:"Tailscale Service name (svc:...). Defaults to svc: followed by the configuration key." json:"name,omitempty" toml:"name,omitempty" yaml:"name,omitempty" export:"true"`
+
+	// TerminateTLS lets Tailscale terminate TLS before forwarding to the
+	// entryPoint, in which case the Service's own fully-qualified name is
+	// the only permitted SNI. Off by default: TLS is Traefik's, as it is on
+	// any other entryPoint.
+	TerminateTLS bool `description:"Let Tailscale terminate TLS before forwarding to the entryPoint, instead of Traefik terminating it." json:"terminateTLS,omitempty" toml:"terminateTLS,omitempty" yaml:"terminateTLS,omitempty" export:"true"`
+
+	// ProxyProtocol is the PROXY protocol version Tailscale uses when it
+	// forwards a connection to the entryPoint, or 0 to disable it.
+	//
+	// It defaults to 2 because a Service is delivered over a loopback
+	// socket: without the header every connection appears to come from
+	// 127.0.0.1, and the client's tailnet address is lost to access logs,
+	// IP allow-lists and X-Forwarded-For alike.
+	ProxyProtocol int `description:"PROXY protocol version Tailscale uses to forward connections, carrying the client address. 0 disables it." json:"proxyProtocol,omitempty" toml:"proxyProtocol,omitempty" yaml:"proxyProtocol,omitempty" export:"true"`
+}
+
+// SetDefaults sets the default values.
+func (t *TailnetService) SetDefaults() {
+	t.ProxyProtocol = 2
+}

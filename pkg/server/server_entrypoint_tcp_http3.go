@@ -50,6 +50,12 @@ func newHTTP3Server(ctx context.Context, name string, config *static.EntryPoint,
 		return nil, errors.New("advertised port must be greater than or equal to zero")
 	}
 
+	if config.TailnetService != "" {
+		// A Tailscale Service is forwarded to the entryPoint as TCP, so
+		// there is no packet conn for QUIC to read from.
+		return nil, errors.New("http3 is not supported on a Tailscale Service entryPoint")
+	}
+
 	var node *tailnet.Node
 	if config.Tailnet != "" {
 		// Binding is deferred to Start: tsnet needs a concrete IP per packet

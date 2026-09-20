@@ -60,6 +60,11 @@ func (s *Server) Start(ctx context.Context) {
 		s.Stop()
 	}()
 
+	// Before the entryPoints: a tailnet that only advertises routes has no
+	// entryPoint to bring it up, and its routes exist only while it is
+	// joined.
+	s.tailnets.Start(ctx)
+
 	s.tcpEntryPoints.Start()
 	s.udpEntryPoints.Start()
 	s.watcher.Start()

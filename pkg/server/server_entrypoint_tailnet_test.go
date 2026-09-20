@@ -14,7 +14,11 @@ func testRegistry(t *testing.T) *tailnet.Registry {
 	t.Helper()
 
 	registry, err := tailnet.NewRegistry(map[string]*static.Tailnet{
-		"corp": {StateDir: t.TempDir()},
+		"corp": {
+			StateDir:      t.TempDir(),
+			AdvertiseTags: []string{"tag:proxy"},
+			Services:      map[string]*static.TailnetService{"myapp": {}},
+		},
 	})
 	require.NoError(t, err)
 	t.Cleanup(registry.Close)
@@ -142,4 +146,80 @@ func TestWriteCloserRejectsConnWithoutCloseWrite(t *testing.T) {
 
 	_, err := writeCloser(server)
 	require.ErrorContains(t, err, "unknown connection type")
+}
+
+// A Service entryPoint binds the Service rather than the node's own
+// addresses, and must not wait for the tailnet to do it.
+func TestBuildTailnetServiceListenerDoesNotWait(t *testing.T) {
+	config := tailnetEntryPoint("corp")
+	config.Address = "127.0.0.1:8443"
+	config.TailnetService = "myapp"
+
+	listener, err := buildListener(t.Context(), "websecure", config, testRegistry(t))
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = listener.Close() })
+
+	// The address stands in for the Service until it is hosted.
+	require.NotNil(t, listener.Addr())
+	assert.Equal(t, "myapp:8443", listener.Addr().String())
+}
+
+func TestBuildTailnetServiceListenerUnknownService(t *testing.T) {
+	config := tailnetEntryPoint("corp")
+	config.Address = "127.0.0.1:8443"
+	config.TailnetService = "typo"
+
+	_, err := buildListener(t.Context(), "websecure", config, testRegistry(t))
+	require.ErrorContains(t, err, `unknown Tailscale Service "typo"`)
+}
+
+func TestTailnetServiceRequiresATailnet(t *testing.T) {
+	config := tailnetEntryPoint("")
+	config.TailnetService = "myapp"
+
+	_, err := buildListener(t.Context(), "websecure", config, testRegistry(t))
+	require.ErrorContains(t, err, "tailnetService requires the entryPoint to name a tailnet")
+}
+
+// A Service is advertised on a named port, so an entryPoint that lets the
+// kernel choose one has nothing to advertise.
+func TestTailnetServiceRejectsPortZero(t *testing.T) {
+	config := tailnetEntryPoint("corp")
+	config.Address = "127.0.0.1:0"
+	config.TailnetService = "myapp"
+
+	_, err := buildListener(t.Context(), "websecure", config, testRegistry(t))
+	require.ErrorContains(t, err, "must name the port it advertises")
+}
+
+// The entryPoint's own proxyProtocol judges the peer, which for a Service is
+// always the loopback forwarder, so the two must not be combined.
+func TestTailnetServiceRejectsEntryPointProxyProtocol(t *testing.T) {
+	config := tailnetEntryPoint("corp")
+	config.Address = "127.0.0.1:8443"
+	config.TailnetService = "myapp"
+	config.ProxyProtocol = &static.ProxyProtocol{Insecure: true}
+
+	_, err := buildListener(t.Context(), "websecure", config, testRegistry(t))
+	require.ErrorContains(t, err, "use the Service's own proxyProtocol option")
+}
+
+func TestTailnetServiceRejectsHTTP3(t *testing.T) {
+	config := tailnetEntryPoint("corp")
+	config.Address = "127.0.0.1:8443"
+	config.TailnetService = "myapp"
+	config.HTTP3 = &static.HTTP3Config{}
+
+	_, err := NewTCPEntryPoint(t.Context(), "websecure", config, nil, nil, testRegistry(t))
+	require.ErrorContains(t, err, "http3 is not supported on a Tailscale Service entryPoint")
+}
+
+func TestTailnetServiceRejectedOnUDPEntryPoint(t *testing.T) {
+	config := tailnetEntryPoint("corp")
+	config.Address = "127.0.0.1:8053/udp"
+	config.TailnetService = "myapp"
+	config.UDP = &static.UDPConfig{}
+
+	_, err := NewUDPEntryPoint(config, "dns", testRegistry(t))
+	require.ErrorContains(t, err, "tailnetService is not supported on a UDP entryPoint")
 }

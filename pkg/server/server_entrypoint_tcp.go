@@ -538,9 +538,31 @@ func buildTailnetListener(ctx context.Context, config *static.EntryPoint, tailne
 		return nil, errors.New("reusePort is not supported on a tailnet entryPoint")
 	}
 
-	listener := node.LazyListen(ctx, "tcp", config.GetAddress())
+	var listener net.Listener
+	if config.TailnetService != "" {
+		port, err := entryPointPort(config)
+		if err != nil {
+			return nil, err
+		}
+
+		if !node.HasService(config.TailnetService) {
+			return nil, fmt.Errorf("unknown Tailscale Service %q on tailnet %q", config.TailnetService, config.Tailnet)
+		}
+
+		listener = node.LazyListenService(ctx, config.TailnetService, port)
+	} else {
+		listener = node.LazyListen(ctx, "tcp", config.GetAddress())
+	}
 
 	if config.ProxyProtocol != nil {
+		if config.TailnetService != "" {
+			// A Service reaches the entryPoint over a loopback socket, so the
+			// peer is never the client and a trusted-IP policy has nothing
+			// to judge. The Service's own proxyProtocol option carries the
+			// client address instead, and is read before we get here.
+			return nil, errors.New("proxyProtocol is not supported on a Tailscale Service entryPoint: use the Service's own proxyProtocol option")
+		}
+
 		listener, err = buildProxyProtocolListener(ctx, config, listener)
 		if err != nil {
 			return nil, fmt.Errorf("error creating proxy protocol listener: %w", err)
@@ -550,9 +572,35 @@ func buildTailnetListener(ctx context.Context, config *static.EntryPoint, tailne
 	return &onceCloseListener{Listener: listener}, nil
 }
 
+// entryPointPort is the port a Tailscale Service advertises, taken from the
+// entryPoint's own address so that the two cannot disagree.
+func entryPointPort(config *static.EntryPoint) (uint16, error) {
+	_, portStr, err := net.SplitHostPort(config.GetAddress())
+	if err != nil {
+		return 0, fmt.Errorf("parsing entryPoint address %q: %w", config.GetAddress(), err)
+	}
+
+	port, err := net.LookupPort("tcp", portStr)
+	if err != nil {
+		return 0, fmt.Errorf("parsing entryPoint port %q: %w", portStr, err)
+	}
+
+	if port == 0 {
+		// tsnet refuses to advertise port 0, and a Service on an
+		// arbitrary port could not be reached by name anyway.
+		return 0, errors.New("a Tailscale Service entryPoint must name the port it advertises, not port 0")
+	}
+
+	return uint16(port), nil
+}
+
 func buildListener(ctx context.Context, name string, config *static.EntryPoint, tailnets *tailnet.Registry) (net.Listener, error) {
 	if config.Tailnet != "" {
 		return buildTailnetListener(ctx, config, tailnets)
+	}
+
+	if config.TailnetService != "" {
+		return nil, errors.New("tailnetService requires the entryPoint to name a tailnet")
 	}
 
 	var listener net.Listener

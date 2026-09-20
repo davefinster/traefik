@@ -110,6 +110,12 @@ func NewUDPEntryPoint(config *static.EntryPoint, name string, tailnets *tailnet.
 		done:                   make(chan struct{}),
 	}
 
+	if config.TailnetService != "" {
+		// Tailscale Services are forwarded as TCP, so a UDP entryPoint has
+		// nothing to accept from one.
+		return nil, errors.New("tailnetService is not supported on a UDP entryPoint")
+	}
+
 	if config.Tailnet != "" {
 		if config.ReusePort {
 			return nil, errors.New("reusePort is not supported on a tailnet entryPoint")

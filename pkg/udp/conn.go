@@ -19,7 +19,11 @@ var errClosedListener = errors.New("udp: listener closed")
 
 // Listener augments a session-oriented Listener over a UDP PacketConn.
 type Listener struct {
-	pConn *net.UDPConn
+	// pConn is a net.PacketConn rather than a *net.UDPConn because the
+	// packets do not always come from a host socket: a tailnet entryPoint
+	// reads them from the in-process userspace network stack. Only the
+	// PacketConn methods are used either way.
+	pConn net.PacketConn
 
 	mu    sync.RWMutex
 	conns map[string]*Conn
@@ -40,13 +44,12 @@ func ListenPacketConn(packetConn net.PacketConn, timeout time.Duration) (*Listen
 		return nil, errors.New("timeout should be greater than zero")
 	}
 
-	pConn, ok := packetConn.(*net.UDPConn)
-	if !ok {
-		return nil, errors.New("packet conn is not an UDPConn")
+	if packetConn == nil {
+		return nil, errors.New("packet conn is required")
 	}
 
 	l := &Listener{
-		pConn:     pConn,
+		pConn:     packetConn,
 		acceptCh:  make(chan *Conn),
 		conns:     make(map[string]*Conn),
 		accepting: true,

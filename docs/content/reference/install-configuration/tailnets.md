@@ -134,6 +134,20 @@ TLS behaves exactly as it does on a host entryPoint: certificates, TLS options
 and certificate resolvers are all still Traefik's, and a tailnet entryPoint can
 terminate TLS in the usual way.
 
+!!! note "HTTP/3 and UDP on a tailnet"
+
+    Packets on a tailnet entryPoint come from the in-process network stack
+    rather than from a host socket, so the kernel UDP optimizations QUIC uses
+    on an ordinary socket (segmentation offload, out-of-band data, the
+    don't-fragment bit) are unavailable. `quic-go` says so once at startup and
+    falls back to plain reads and writes. It may also warn that it could not
+    size the socket buffers; that warning does not apply to a tailnet
+    entryPoint and can be silenced with
+    `QUIC_GO_DISABLE_RECEIVE_BUFFER_WARNING=true`.
+
+    An address such as `:443` becomes one listener per tailnet address, so
+    both address families are served.
+
 !!! info "Options that do not apply"
 
     - `reusePort` is rejected on a tailnet entryPoint. The listener is a socket

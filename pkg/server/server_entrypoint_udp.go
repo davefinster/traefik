@@ -190,9 +190,17 @@ func (ep *UDPEntryPoint) bind(ctx context.Context) ([]*udp.Listener, error) {
 		listener, err := udp.ListenPacketConn(conn, ep.timeout)
 		if err != nil {
 			log.Ctx(ctx).Error().Err(err).Msg("Error creating tailnet UDP listener")
+			_ = conn.Close()
 			continue
 		}
 		listeners = append(listeners, listener)
+	}
+
+	// Every address failed. Returning here rather than settling for an empty
+	// set keeps the entryPoint from looking started while listening on
+	// nothing at all.
+	if len(listeners) == 0 {
+		return nil, fmt.Errorf("no tailnet listener could be created for entryPoint address %q", ep.address)
 	}
 
 	ep.mu.Lock()

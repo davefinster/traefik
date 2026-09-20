@@ -386,6 +386,7 @@
       maxIdleConnsPerHost = 42
       disableHTTP2 = true
       peerCertURI = "foobar"
+      tailnet = "foobar"
 
       [[http.serversTransports.ServersTransport0.certificates]]
         certFile = "foobar"
@@ -415,6 +416,7 @@
       maxIdleConnsPerHost = 42
       disableHTTP2 = true
       peerCertURI = "foobar"
+      tailnet = "foobar"
 
       [[http.serversTransports.ServersTransport1.certificates]]
         certFile = "foobar"
@@ -515,6 +517,7 @@
       dialKeepAlive = "42s"
       dialTimeout = "42s"
       terminationDelay = "42s"
+      tailnet = "foobar"
       [tcp.serversTransports.TCPServersTransport0.proxyProtocol]
         version = 42
       [tcp.serversTransports.TCPServersTransport0.tls]
@@ -537,6 +540,7 @@
       dialKeepAlive = "42s"
       dialTimeout = "42s"
       terminationDelay = "42s"
+      tailnet = "foobar"
       [tcp.serversTransports.TCPServersTransport1.proxyProtocol]
         version = 42
       [tcp.serversTransports.TCPServersTransport1.tls]

@@ -37,6 +37,7 @@
     address = "foobar"
     allowACMEByPass = true
     reusePort = true
+    tailnet = "foobar"
     asDefault = true
     [entryPoints.EntryPoint0.transport]
       keepAliveMaxTime = "42s"
@@ -653,6 +654,26 @@
 
 [spiffe]
   workloadAPIAddr = "foobar"
+
+[tailnets]
+  [tailnets.Tailnet0]
+    hostname = "foobar"
+    stateDir = "foobar"
+    authKey = "foobar"
+    authKeyFile = "foobar"
+    controlURL = "foobar"
+    ephemeral = true
+    advertiseTags = ["foobar", "foobar"]
+    port = 42
+  [tailnets.Tailnet1]
+    hostname = "foobar"
+    stateDir = "foobar"
+    authKey = "foobar"
+    authKeyFile = "foobar"
+    controlURL = "foobar"
+    ephemeral = true
+    advertiseTags = ["foobar", "foobar"]
+    port = 42
 
 [ocsp]
   [ocsp.responderOverrides]

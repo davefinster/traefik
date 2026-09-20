@@ -41,6 +41,7 @@ entryPoints:
     address: foobar
     allowACMEByPass: true
     reusePort: true
+    tailnet: foobar
     asDefault: true
     transport:
       lifeCycle:
@@ -720,6 +721,29 @@ core:
   defaultRuleSyntax: foobar
 spiffe:
   workloadAPIAddr: foobar
+tailnets:
+  Tailnet0:
+    hostname: foobar
+    stateDir: foobar
+    authKey: foobar
+    authKeyFile: foobar
+    controlURL: foobar
+    ephemeral: true
+    advertiseTags:
+      - foobar
+      - foobar
+    port: 42
+  Tailnet1:
+    hostname: foobar
+    stateDir: foobar
+    authKey: foobar
+    authKeyFile: foobar
+    controlURL: foobar
+    ephemeral: true
+    advertiseTags:
+      - foobar
+      - foobar
+    port: 42
 ocsp:
   responderOverrides:
     name0: foobar

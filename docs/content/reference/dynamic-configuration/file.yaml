@@ -462,6 +462,7 @@ http:
           - foobar
           - foobar
         trustDomain: foobar
+      tailnet: foobar
     ServersTransport1:
       serverName: foobar
       insecureSkipVerify: true
@@ -494,6 +495,7 @@ http:
           - foobar
           - foobar
         trustDomain: foobar
+      tailnet: foobar
 tcp:
   routers:
     TCPRouter0:
@@ -601,6 +603,7 @@ tcp:
             - foobar
             - foobar
           trustDomain: foobar
+      tailnet: foobar
     TCPServersTransport1:
       dialKeepAlive: 42s
       dialTimeout: 42s
@@ -624,6 +627,7 @@ tcp:
             - foobar
             - foobar
           trustDomain: foobar
+      tailnet: foobar
 udp:
   routers:
     UDPRouter0:

@@ -40,7 +40,8 @@ func main() {
 func run() error {
 	var (
 		serviceName = flag.String("service", "svc:traefik-vip-harness", "Tailscale Service to create and host")
-		tag         = flag.String("tag", "tag:traefik-vip-harness", "ACL tag the harness nodes carry")
+		hostTag     = flag.String("host-tag", "tag:traefik-vip-harness", "ACL tag the host node carries; must be in autoApprovers.services for the Service")
+		clientTag   = flag.String("client-tag", "", "ACL tag the client node carries; must be granted access to the Service. Defaults to -host-tag")
 		keep        = flag.Bool("keep", false, "leave the Service in place on exit, for inspection")
 		showPolicy  = flag.Bool("policy", false, "print the tailnet policy's tag and service grants, then exit")
 		only        = flag.String("only", "", "run only the named variant")
@@ -61,8 +62,12 @@ func run() error {
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 
+	if *clientTag == "" {
+		*clientTag = *hostTag
+	}
+
 	fmt.Println("== Tailscale Service VIP harness ==")
-	fmt.Printf("service: %s   tag: %s\n\n", svc, *tag)
+	fmt.Printf("service: %s\nhost tag: %s   client tag: %s\n\n", svc, *hostTag, *clientTag)
 
 	api, err := newAPI(ctx, clientID, clientSecret)
 	if err != nil {
@@ -74,15 +79,22 @@ func run() error {
 		return describePolicy(ctx, api)
 	}
 
-	if err := checkPolicy(ctx, api, svc, *tag); err != nil {
+	if err := checkPolicy(ctx, api, svc, *hostTag); err != nil {
 		return err
 	}
 
-	authKey, err := api.mintAuthKey(ctx, []string{*tag})
+	hostKey, err := api.mintAuthKey(ctx, []string{*hostTag})
 	if err != nil {
-		return fmt.Errorf("minting auth key (is %s owned by the OAuth client's tag in tagOwners?): %w", *tag, err)
+		return fmt.Errorf("minting host auth key (is %s owned by the OAuth client's tag in tagOwners?): %w", *hostTag, err)
 	}
-	fmt.Printf("[ok] minted an ephemeral auth key for %s\n", *tag)
+	clientKey := hostKey
+	if *clientTag != *hostTag {
+		clientKey, err = api.mintAuthKey(ctx, []string{*clientTag})
+		if err != nil {
+			return fmt.Errorf("minting client auth key for %s: %w", *clientTag, err)
+		}
+	}
+	fmt.Printf("[ok] minted ephemeral auth keys for %s and %s\n", *hostTag, *clientTag)
 
 	stateDir, err := os.MkdirTemp("", "tailnetvip-*")
 	if err != nil {
@@ -91,13 +103,13 @@ func run() error {
 	defer os.RemoveAll(stateDir)
 
 	fmt.Println("[..] bringing up host and client nodes")
-	host, err := startNode(ctx, stateDir+"/host", "vip-harness-host", authKey, []string{*tag})
+	host, err := startNode(ctx, stateDir+"/host", "vip-harness-host", hostKey, []string{*hostTag})
 	if err != nil {
 		return err
 	}
 	defer host.close()
 
-	client, err := startNode(ctx, stateDir+"/client", "vip-harness-client", authKey, []string{*tag})
+	client, err := startNode(ctx, stateDir+"/client", "vip-harness-client", clientKey, []string{*clientTag})
 	if err != nil {
 		return err
 	}
@@ -125,7 +137,7 @@ func run() error {
 		if err := api.createService(ctx, vipService{
 			Name:    svc.String(),
 			Ports:   v.servicePorts,
-			Tags:    []string{*tag},
+			Tags:    []string{*hostTag},
 			Comment: "ephemeral: created by the traefik tailnetvip harness",
 		}); err != nil {
 			return fmt.Errorf("creating Service for %s: %w", v.name, err)
@@ -294,6 +306,16 @@ func describePolicy(ctx context.Context, api *api) error {
 			Services map[string][]string `json:"services"`
 			Routes   map[string][]string `json:"routes"`
 		} `json:"autoApprovers"`
+		ACLs []struct {
+			Action string   `json:"action"`
+			Src    []string `json:"src"`
+			Dst    []string `json:"dst"`
+		} `json:"acls"`
+		Grants []struct {
+			Src []string `json:"src"`
+			Dst []string `json:"dst"`
+			IP  []string `json:"ip"`
+		} `json:"grants"`
 	}
 	if err := json.Unmarshal(stripped, &doc); err != nil {
 		return fmt.Errorf("decoding policy: %w", err)
@@ -310,6 +332,22 @@ func describePolicy(ctx context.Context, api *api) error {
 	}
 	for _, svc := range sortedKeys(doc.AutoApprovers.Services) {
 		fmt.Printf("  %-46s %v\n", svc, doc.AutoApprovers.Services[svc])
+	}
+
+	var top map[string]json.RawMessage
+	if err := json.Unmarshal(stripped, &top); err == nil {
+		fmt.Println("\npolicy top-level keys:")
+		for _, k := range sortedKeys(top) {
+			fmt.Printf("  %-20s %d bytes\n", k, len(top[k]))
+		}
+	}
+
+	fmt.Println("\ngrants:")
+	for _, g := range doc.Grants {
+		fmt.Printf("  %v -> %v  ip=%v\n", g.Src, g.Dst, g.IP)
+	}
+	if len(doc.Grants) == 0 {
+		fmt.Println("  (none)")
 	}
 
 	fmt.Println("\nautoApprovers.routes:")

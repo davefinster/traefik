@@ -123,6 +123,11 @@ type Node struct {
 	name string
 	cfg  *static.Tailnet
 
+	// startMu serialises join attempts. It is deliberately not n.mu:
+	// tsnet.Server.Start takes no context and can block for as long as the
+	// control plane keeps it waiting, and Close must not queue behind it.
+	startMu sync.Mutex
+
 	mu     sync.Mutex
 	srv    *tsnet.Server
 	closed bool
@@ -134,14 +139,16 @@ func (n *Node) Name() string { return n.name }
 
 // server returns a started tsnet.Server, building and joining as needed.
 func (n *Node) server() (*tsnet.Server, error) {
-	n.mu.Lock()
-	defer n.mu.Unlock()
-
-	if n.closed {
-		return nil, net.ErrClosed
+	if srv, err, ok := n.current(); ok {
+		return srv, err
 	}
-	if n.srv != nil {
-		return n.srv, nil
+
+	n.startMu.Lock()
+	defer n.startMu.Unlock()
+
+	// Another caller may have joined while this one waited for the lock.
+	if srv, err, ok := n.current(); ok {
+		return srv, err
 	}
 
 	srv, err := n.build()
@@ -151,13 +158,40 @@ func (n *Node) server() (*tsnet.Server, error) {
 
 	// tsnet.Server.Start cleans up after itself on failure, so a server that
 	// failed here needs no Close; dropping it means the next attempt gets a
-	// fresh sync.Once rather than the cached error.
+	// fresh sync.Once rather than the cached error, which is the whole
+	// reason a failed node is rebuilt instead of retried in place.
 	if err := srv.Start(); err != nil {
 		return nil, fmt.Errorf("tailnet %q: joining: %w", n.name, err)
 	}
 
+	n.mu.Lock()
+	if n.closed {
+		n.mu.Unlock()
+		// Closed while this join was in flight. The server did start, so it
+		// owns resources and must be released.
+		_ = srv.Close()
+		return nil, net.ErrClosed
+	}
 	n.srv = srv
+	n.mu.Unlock()
+
 	return srv, nil
+}
+
+// current reports the node's settled state: a joined server, or the closed
+// error. ok is false when a join still has to happen.
+func (n *Node) current() (*tsnet.Server, error, bool) {
+	n.mu.Lock()
+	defer n.mu.Unlock()
+
+	switch {
+	case n.closed:
+		return nil, net.ErrClosed, true
+	case n.srv != nil:
+		return n.srv, nil, true
+	default:
+		return nil, nil, false
+	}
 }
 
 // build assembles an unstarted tsnet.Server from the configuration, resolving

@@ -2,6 +2,7 @@ package tailnet
 
 import (
 	"context"
+	"errors"
 	"net"
 	"sync"
 	"time"
@@ -72,21 +73,37 @@ func (l *lazyListener) listener() (net.Listener, error) {
 	logger := log.Ctx(l.ctx).With().Str("tailnet", l.node.Name()).Logger()
 
 	for interval := retryInitialInterval; ; interval = min(interval*2, retryMaxInterval) {
-		ln, err := l.node.Listen(l.network, l.addr)
-		if err == nil {
-			l.mu.Lock()
-			// Closed while we were binding: the listener we just opened is
-			// nobody's to accept on.
-			if l.closed {
+		// The bind runs on its own goroutine because joining a tailnet is
+		// not cancellable: tsnet's Start takes no context and can block for
+		// as long as the control plane keeps it waiting. A shutdown has to
+		// be able to abandon the attempt, and the goroutine hands over or
+		// releases whatever it eventually binds.
+		bound := make(chan error, 1)
+		go func() { bound <- l.bind() }()
+
+		var err error
+		select {
+		case err = <-bound:
+			if err == nil {
+				l.mu.Lock()
+				ln := l.ln
 				l.mu.Unlock()
-				_ = ln.Close()
+				if ln != nil {
+					logger.Info().Stringer("address", ln.Addr()).Msg("Listening on tailnet")
+					return ln, nil
+				}
 				return nil, net.ErrClosed
 			}
-			l.ln = ln
-			l.mu.Unlock()
 
-			logger.Info().Stringer("address", ln.Addr()).Msg("Listening on tailnet")
-			return ln, nil
+			// A closed node is not coming back, so there is nothing to
+			// retry towards.
+			if errors.Is(err, net.ErrClosed) {
+				return nil, net.ErrClosed
+			}
+		case <-l.done:
+			return nil, net.ErrClosed
+		case <-l.ctx.Done():
+			return nil, net.ErrClosed
 		}
 
 		logger.Warn().Err(err).Dur("retryIn", interval).Msg("Cannot listen on tailnet yet, retrying")
@@ -99,6 +116,28 @@ func (l *lazyListener) listener() (net.Listener, error) {
 			return nil, net.ErrClosed
 		}
 	}
+}
+
+// bind makes one attempt to listen on the tailnet, storing the listener on
+// success. It closes what it bound if the lazyListener was closed meanwhile,
+// or if another attempt got there first, so an abandoned attempt leaks
+// nothing.
+func (l *lazyListener) bind() error {
+	ln, err := l.node.Listen(l.network, l.addr)
+	if err != nil {
+		return err
+	}
+
+	l.mu.Lock()
+	if l.closed || l.ln != nil {
+		l.mu.Unlock()
+		_ = ln.Close()
+		return nil
+	}
+	l.ln = ln
+	l.mu.Unlock()
+
+	return nil
 }
 
 // Close releases the underlying listener and stops any pending retry.

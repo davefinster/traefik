@@ -148,6 +148,13 @@ terminate TLS in the usual way.
     An address such as `:443` becomes one listener per tailnet address, so
     both address families are served.
 
+An entryPoint naming a tailnet that is not configured is a startup error: the
+entryPoint could never serve, and the static configuration is known in full at
+boot. A serversTransport naming one is only a warning, because dynamic
+configuration arrives and changes while Traefik runs, and one bad transport
+must not take the proxy down with it. It still fails every request through it
+(see [Backends over a Tailnet](#backends-over-a-tailnet)).
+
 !!! info "Options that do not apply"
 
     - `reusePort` is rejected on a tailnet entryPoint. The listener is a socket

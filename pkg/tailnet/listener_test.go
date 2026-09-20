@@ -83,7 +83,7 @@ func TestLazyListenerRetriesUntilClosed(t *testing.T) {
 	require.NoError(t, listener.Close())
 }
 
-// Cancelling the context abandons a bind that has not succeeded, so a
+// Canceling the context abandons a bind that has not succeeded, so a
 // listener nobody is waiting for does not retry forever.
 func TestLazyListenerContextCancelAbandonsPendingBind(t *testing.T) {
 	ctx, cancel := context.WithCancel(t.Context())
@@ -105,7 +105,7 @@ func TestLazyListenerContextCancelAbandonsPendingBind(t *testing.T) {
 	case err := <-accepted:
 		require.ErrorIs(t, err, net.ErrClosed)
 	case <-time.After(5 * time.Second):
-		t.Fatal("Accept did not return after the context was cancelled")
+		t.Fatal("Accept did not return after the context was canceled")
 	}
 }
 

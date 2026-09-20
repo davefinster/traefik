@@ -55,6 +55,37 @@ func (l *lazyListener) Accept() (net.Conn, error) {
 	return ln.Accept()
 }
 
+// Close releases the underlying listener and stops any pending retry.
+func (l *lazyListener) Close() error {
+	l.mu.Lock()
+	if l.closed {
+		l.mu.Unlock()
+		return nil
+	}
+	l.closed = true
+	ln := l.ln
+	l.ln = nil
+	close(l.done)
+	l.mu.Unlock()
+
+	if ln == nil {
+		return nil
+	}
+	return ln.Close()
+}
+
+// Addr reports the bound tailnet address, or the address it is still trying
+// to bind while the node comes up.
+func (l *lazyListener) Addr() net.Addr {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+
+	if l.ln != nil {
+		return l.ln.Addr()
+	}
+	return pendingAddr{network: l.network, addr: l.addr}
+}
+
 // listener returns the bound tailnet listener, binding it on first call and
 // retrying until it succeeds or the listener is closed.
 func (l *lazyListener) listener() (net.Listener, error) {
@@ -138,37 +169,6 @@ func (l *lazyListener) bind() error {
 	l.mu.Unlock()
 
 	return nil
-}
-
-// Close releases the underlying listener and stops any pending retry.
-func (l *lazyListener) Close() error {
-	l.mu.Lock()
-	if l.closed {
-		l.mu.Unlock()
-		return nil
-	}
-	l.closed = true
-	ln := l.ln
-	l.ln = nil
-	close(l.done)
-	l.mu.Unlock()
-
-	if ln == nil {
-		return nil
-	}
-	return ln.Close()
-}
-
-// Addr reports the bound tailnet address, or the address it is still trying
-// to bind while the node comes up.
-func (l *lazyListener) Addr() net.Addr {
-	l.mu.Lock()
-	defer l.mu.Unlock()
-
-	if l.ln != nil {
-		return l.ln.Addr()
-	}
-	return pendingAddr{network: l.network, addr: l.addr}
 }
 
 // pendingAddr stands in for the tailnet address before the node has one, so

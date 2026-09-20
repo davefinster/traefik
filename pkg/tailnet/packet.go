@@ -58,7 +58,7 @@ func (n *Node) ListenPacketAll(ctx context.Context, network, addr string) ([]net
 }
 
 // RetryListenPacketAll keeps trying ListenPacketAll with a capped backoff
-// until it succeeds, ctx is cancelled, or done is closed. It is how a UDP or
+// until it succeeds, ctx is canceled, or done is closed. It is how a UDP or
 // HTTP/3 entryPoint waits out a tailnet that is not up yet without holding up
 // the rest of Traefik.
 func (n *Node) RetryListenPacketAll(ctx context.Context, network, addr string, done <-chan struct{}) ([]net.PacketConn, error) {

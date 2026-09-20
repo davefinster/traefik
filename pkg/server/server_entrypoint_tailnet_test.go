@@ -106,6 +106,7 @@ func TestNewTCPEntryPointOnTailnetBuildsWithoutTheTailnet(t *testing.T) {
 // its write half, which is what a tailnet (userspace netstack) conn is.
 type closeWriteConn struct {
 	net.Conn
+
 	closedWrite bool
 }
 

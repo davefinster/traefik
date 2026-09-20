@@ -83,7 +83,10 @@ linters:
     gomoddirectives:
       toolchain-pattern: go1\.\d+\.\d+$
       tool-forbidden: true
-      go-version-pattern: ^1\.\d+(\.0)?$
+      # tailscale.com, which pkg/tailnet embeds, requires go >= 1.26.6, so
+      # the go directive has to carry a patch version. Upstream's pattern
+      # ^1\.\d+(\.0)?$ allows only .0.
+      go-version-pattern: ^1\.\d+(\.\d+)?$
       replace-local: true
       replace-allow-list:
         - github.com/abbot/go-http-auth

@@ -538,7 +538,7 @@ func buildTailnetListener(ctx context.Context, config *static.EntryPoint, tailne
 		return nil, errors.New("reusePort is not supported on a tailnet entryPoint")
 	}
 
-	var listener net.Listener = node.LazyListen(ctx, "tcp", config.GetAddress())
+	listener := node.LazyListen(ctx, "tcp", config.GetAddress())
 
 	if config.ProxyProtocol != nil {
 		listener, err = buildProxyProtocolListener(ctx, config, listener)

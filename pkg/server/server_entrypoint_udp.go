@@ -164,6 +164,40 @@ func (ep *UDPEntryPoint) Start(ctx context.Context) {
 	wg.Wait()
 }
 
+// Shutdown closes ep's listener. It eventually closes all "sessions" and
+// releases associated resources, but only after it has waited for a graceTimeout,
+// if any was configured.
+func (ep *UDPEntryPoint) Shutdown(ctx context.Context) {
+	logger := log.Ctx(ctx)
+
+	reqAcceptGraceTimeOut := time.Duration(ep.transportConfiguration.LifeCycle.RequestAcceptGraceTimeout)
+	if reqAcceptGraceTimeOut > 0 {
+		logger.Info().Msgf("Waiting %s for incoming requests to cease", reqAcceptGraceTimeOut)
+		time.Sleep(reqAcceptGraceTimeOut)
+	}
+
+	ep.mu.Lock()
+	if !ep.closed {
+		ep.closed = true
+		// Releases a bind still waiting for the tailnet to come up.
+		close(ep.done)
+	}
+	listeners := ep.listeners
+	ep.mu.Unlock()
+
+	graceTimeOut := time.Duration(ep.transportConfiguration.LifeCycle.GraceTimeOut)
+	for _, listener := range listeners {
+		if err := listener.Shutdown(graceTimeOut); err != nil {
+			logger.Error().Err(err).Send()
+		}
+	}
+}
+
+// Switch replaces ep's handler with the one given as argument.
+func (ep *UDPEntryPoint) Switch(handler udp.Handler) {
+	ep.switcher.Switch(handler)
+}
+
 // bind returns the listeners to accept on, opening them on the tailnet first
 // if this entryPoint is bound to one. It retries until the tailnet answers,
 // so a tailnet that is not up at boot does not take the entryPoint with it.
@@ -231,38 +265,4 @@ func (ep *UDPEntryPoint) accept(listener *udp.Listener) {
 
 		go ep.switcher.ServeUDP(conn)
 	}
-}
-
-// Shutdown closes ep's listener. It eventually closes all "sessions" and
-// releases associated resources, but only after it has waited for a graceTimeout,
-// if any was configured.
-func (ep *UDPEntryPoint) Shutdown(ctx context.Context) {
-	logger := log.Ctx(ctx)
-
-	reqAcceptGraceTimeOut := time.Duration(ep.transportConfiguration.LifeCycle.RequestAcceptGraceTimeout)
-	if reqAcceptGraceTimeOut > 0 {
-		logger.Info().Msgf("Waiting %s for incoming requests to cease", reqAcceptGraceTimeOut)
-		time.Sleep(reqAcceptGraceTimeOut)
-	}
-
-	ep.mu.Lock()
-	if !ep.closed {
-		ep.closed = true
-		// Releases a bind still waiting for the tailnet to come up.
-		close(ep.done)
-	}
-	listeners := ep.listeners
-	ep.mu.Unlock()
-
-	graceTimeOut := time.Duration(ep.transportConfiguration.LifeCycle.GraceTimeOut)
-	for _, listener := range listeners {
-		if err := listener.Shutdown(graceTimeOut); err != nil {
-			logger.Error().Err(err).Send()
-		}
-	}
-}
-
-// Switch replaces ep's handler with the one given as argument.
-func (ep *UDPEntryPoint) Switch(handler udp.Handler) {
-	ep.switcher.Switch(handler)
 }

@@ -25,13 +25,12 @@ import (
 
 	"github.com/rs/zerolog/log"
 	"github.com/traefik/traefik/v3/pkg/config/static"
-	"tailscale.com/ipn/ipnstate"
-	"tailscale.com/tsnet"
-
 	// Registers support for OAuth client secrets (tskey-client-...) as auth
 	// keys. Without it, tsnet would send the client secret to the control
 	// plane as though it were an auth key, and the join would be rejected.
 	_ "tailscale.com/feature/oauthkey"
+	"tailscale.com/ipn/ipnstate"
+	"tailscale.com/tsnet"
 )
 
 // ErrNoTailnets is returned for any operation naming a tailnet when none are
@@ -123,7 +122,7 @@ type Node struct {
 	name string
 	cfg  *static.Tailnet
 
-	// startMu serialises join attempts. It is deliberately not n.mu:
+	// startMu serializes join attempts. It is deliberately not n.mu:
 	// tsnet.Server.Start takes no context and can block for as long as the
 	// control plane keeps it waiting, and Close must not queue behind it.
 	startMu sync.Mutex
@@ -136,95 +135,6 @@ type Node struct {
 // Name returns the configured name of the tailnet, as entryPoints and
 // serversTransports reference it.
 func (n *Node) Name() string { return n.name }
-
-// server returns a started tsnet.Server, building and joining as needed.
-func (n *Node) server() (*tsnet.Server, error) {
-	if srv, err, ok := n.current(); ok {
-		return srv, err
-	}
-
-	n.startMu.Lock()
-	defer n.startMu.Unlock()
-
-	// Another caller may have joined while this one waited for the lock.
-	if srv, err, ok := n.current(); ok {
-		return srv, err
-	}
-
-	srv, err := n.build()
-	if err != nil {
-		return nil, err
-	}
-
-	// tsnet.Server.Start cleans up after itself on failure, so a server that
-	// failed here needs no Close; dropping it means the next attempt gets a
-	// fresh sync.Once rather than the cached error, which is the whole
-	// reason a failed node is rebuilt instead of retried in place.
-	if err := srv.Start(); err != nil {
-		return nil, fmt.Errorf("tailnet %q: joining: %w", n.name, err)
-	}
-
-	n.mu.Lock()
-	if n.closed {
-		n.mu.Unlock()
-		// Closed while this join was in flight. The server did start, so it
-		// owns resources and must be released.
-		_ = srv.Close()
-		return nil, net.ErrClosed
-	}
-	n.srv = srv
-	n.mu.Unlock()
-
-	return srv, nil
-}
-
-// current reports the node's settled state: a joined server, or the closed
-// error. ok is false when a join still has to happen.
-func (n *Node) current() (*tsnet.Server, error, bool) {
-	n.mu.Lock()
-	defer n.mu.Unlock()
-
-	switch {
-	case n.closed:
-		return nil, net.ErrClosed, true
-	case n.srv != nil:
-		return n.srv, nil, true
-	default:
-		return nil, nil, false
-	}
-}
-
-// build assembles an unstarted tsnet.Server from the configuration, resolving
-// the auth key file now: reading it at build time rather than at startup lets
-// a key delivered late by an external system be picked up on a retry.
-func (n *Node) build() (*tsnet.Server, error) {
-	authKey := n.cfg.AuthKey
-	if n.cfg.AuthKeyFile != "" {
-		content, err := os.ReadFile(n.cfg.AuthKeyFile)
-		if err != nil {
-			return nil, fmt.Errorf("tailnet %q: reading authKeyFile: %w", n.name, err)
-		}
-		authKey = strings.TrimSpace(string(content))
-	}
-
-	logger := log.With().Str("tailnet", n.name).Logger()
-
-	return &tsnet.Server{
-		Hostname:      n.cfg.Hostname,
-		Dir:           n.cfg.StateDir,
-		AuthKey:       authKey,
-		ControlURL:    n.cfg.ControlURL,
-		Ephemeral:     n.cfg.Ephemeral,
-		AdvertiseTags: n.cfg.AdvertiseTags,
-		Port:          n.cfg.Port,
-		UserLogf: func(format string, args ...any) {
-			logger.Info().Msgf(format, args...)
-		},
-		Logf: func(format string, args ...any) {
-			logger.Trace().Msgf(format, args...)
-		},
-	}, nil
-}
 
 // DialContext dials addr over the tailnet, joining it on first use.
 func (n *Node) DialContext(ctx context.Context, network, addr string) (net.Conn, error) {
@@ -307,4 +217,93 @@ func (n *Node) Close() {
 	if err := srv.Close(); err != nil {
 		log.Debug().Err(err).Str("tailnet", n.name).Msg("Closing tailnet node")
 	}
+}
+
+// server returns a started tsnet.Server, building and joining as needed.
+func (n *Node) server() (*tsnet.Server, error) {
+	if srv, settled, err := n.current(); settled {
+		return srv, err
+	}
+
+	n.startMu.Lock()
+	defer n.startMu.Unlock()
+
+	// Another caller may have joined while this one waited for the lock.
+	if srv, settled, err := n.current(); settled {
+		return srv, err
+	}
+
+	srv, err := n.build()
+	if err != nil {
+		return nil, err
+	}
+
+	// tsnet.Server.Start cleans up after itself on failure, so a server that
+	// failed here needs no Close; dropping it means the next attempt gets a
+	// fresh sync.Once rather than the cached error, which is the whole
+	// reason a failed node is rebuilt instead of retried in place.
+	if err := srv.Start(); err != nil {
+		return nil, fmt.Errorf("tailnet %q: joining: %w", n.name, err)
+	}
+
+	n.mu.Lock()
+	if n.closed {
+		n.mu.Unlock()
+		// Closed while this join was in flight. The server did start, so it
+		// owns resources and must be released.
+		_ = srv.Close()
+		return nil, net.ErrClosed
+	}
+	n.srv = srv
+	n.mu.Unlock()
+
+	return srv, nil
+}
+
+// current reports the node's settled state: a joined server, or the closed
+// error. settled is false when a join still has to happen.
+func (n *Node) current() (srv *tsnet.Server, settled bool, err error) {
+	n.mu.Lock()
+	defer n.mu.Unlock()
+
+	switch {
+	case n.closed:
+		return nil, true, net.ErrClosed
+	case n.srv != nil:
+		return n.srv, true, nil
+	default:
+		return nil, false, nil
+	}
+}
+
+// build assembles an unstarted tsnet.Server from the configuration, resolving
+// the auth key file now: reading it at build time rather than at startup lets
+// a key delivered late by an external system be picked up on a retry.
+func (n *Node) build() (*tsnet.Server, error) {
+	authKey := n.cfg.AuthKey
+	if n.cfg.AuthKeyFile != "" {
+		content, err := os.ReadFile(n.cfg.AuthKeyFile)
+		if err != nil {
+			return nil, fmt.Errorf("tailnet %q: reading authKeyFile: %w", n.name, err)
+		}
+		authKey = strings.TrimSpace(string(content))
+	}
+
+	logger := log.With().Str("tailnet", n.name).Logger()
+
+	return &tsnet.Server{
+		Hostname:      n.cfg.Hostname,
+		Dir:           n.cfg.StateDir,
+		AuthKey:       authKey,
+		ControlURL:    n.cfg.ControlURL,
+		Ephemeral:     n.cfg.Ephemeral,
+		AdvertiseTags: n.cfg.AdvertiseTags,
+		Port:          n.cfg.Port,
+		UserLogf: func(format string, args ...any) {
+			logger.Info().Msgf(format, args...)
+		},
+		Logf: func(format string, args ...any) {
+			logger.Trace().Msgf(format, args...)
+		},
+	}, nil
 }

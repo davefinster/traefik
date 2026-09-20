@@ -42,6 +42,7 @@ entryPoints:
     allowACMEByPass: true
     reusePort: true
     tailnet: foobar
+    tailnetService: foobar
     asDefault: true
     transport:
       lifeCycle:
@@ -733,6 +734,18 @@ tailnets:
       - foobar
       - foobar
     port: 42
+    routes:
+      - foobar
+      - foobar
+    services:
+      Service0:
+        name: foobar
+        terminateTLS: true
+        proxyProtocol: 42
+      Service1:
+        name: foobar
+        terminateTLS: true
+        proxyProtocol: 42
   Tailnet1:
     hostname: foobar
     stateDir: foobar
@@ -744,6 +757,18 @@ tailnets:
       - foobar
       - foobar
     port: 42
+    routes:
+      - foobar
+      - foobar
+    services:
+      Service0:
+        name: foobar
+        terminateTLS: true
+        proxyProtocol: 42
+      Service1:
+        name: foobar
+        terminateTLS: true
+        proxyProtocol: 42
 ocsp:
   responderOverrides:
     name0: foobar

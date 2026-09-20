@@ -88,6 +88,11 @@ entryPoints:
 | <a id="opt-tailnets-name-ephemeral" href="#opt-tailnets-name-ephemeral" title="#opt-tailnets-name-ephemeral">`tailnets.<name>.`<br />`ephemeral`</a> | Registers the node as ephemeral, so the control plane removes it shortly after it goes offline. <br /> Suited to replicas that come and go; with it set, `stateDir` need not outlive the process. | false | No |
 | <a id="opt-tailnets-name-advertiseTags" href="#opt-tailnets-name-advertiseTags" title="#opt-tailnets-name-advertiseTags">`tailnets.<name>.`<br />`advertiseTags`</a> | ACL tags the node advertises (`tag:...`). <br /> Required when `authKey` is an OAuth client secret: Tailscale refuses such a join without explicit tags. | - | No |
 | <a id="opt-tailnets-name-port" href="#opt-tailnets-name-port" title="#opt-tailnets-name-port">`tailnets.<name>.`<br />`port`</a> | Local UDP port for WireGuard and peer-to-peer traffic. <br /> Zero picks one automatically, which is what most deployments want; pin it when a firewall has to be opened for direct connections. | 0 | No |
+| <a id="opt-tailnets-name-routes" href="#opt-tailnets-name-routes" title="#opt-tailnets-name-routes">`tailnets.<name>.`<br />`routes`</a> | CIDR prefixes the node advertises into the tailnet, subject to approval by an admin or an ACL auto-approver. <br /> Traefik answers only on the addresses its entryPoints bind; this is not a subnet router. <br /> More information [here](#advertising-routes). | -     | No       |
+| <a id="opt-tailnets-name-services-name" href="#opt-tailnets-name-services-name" title="#opt-tailnets-name-services-name">`tailnets.<name>.`<br />`services.<name>`</a> | A Tailscale Service this node can host, keyed by the name entryPoints reference it as. <br /> More information [here](#hosting-tailscale-services). | -     | No       |
+| <a id="opt-tailnets-name-services-name-name" href="#opt-tailnets-name-services-name-name" title="#opt-tailnets-name-services-name-name">`tailnets.<name>.`<br />`services.<name>.name`</a> | The Tailscale Service name, which must start with `svc:`. <br /> Defaults to `svc:` followed by the key the Service is configured under. | -     | No       |
+| <a id="opt-tailnets-name-services-name-terminateTLS" href="#opt-tailnets-name-services-name-terminateTLS" title="#opt-tailnets-name-services-name-terminateTLS">`tailnets.<name>.`<br />`services.<name>.terminateTLS`</a> | Lets Tailscale terminate TLS before forwarding to the entryPoint, in which case the Service's own fully-qualified name is the only permitted SNI. <br /> Off by default: TLS is Traefik's, as on any other entryPoint. | false | No       |
+| <a id="opt-tailnets-name-services-name-proxyProtocol" href="#opt-tailnets-name-services-name-proxyProtocol" title="#opt-tailnets-name-services-name-proxyProtocol">`tailnets.<name>.`<br />`services.<name>.proxyProtocol`</a> | The PROXY protocol version Tailscale uses when forwarding a connection to the entryPoint, or `0` to disable it. <br /> It carries the client's tailnet address, which is otherwise lost. <br /> More information [here](#client-addresses-on-a-service). | 2     | No       |
 
 ## EntryPoints on a Tailnet
 
@@ -165,6 +170,143 @@ must not take the proxy down with it. It still fails every request through it
 
     `proxyProtocol` does still apply, for a PROXY-protocol-speaking peer on the
     tailnet.
+
+## Advertising Routes
+
+`routes` advertises CIDR prefixes from the node, which lets an entryPoint bind
+an address that is not the node's own — an alias address on the tailnet, which
+survives the node being replaced and can be moved between nodes.
+
+```yaml tab="File (YAML)"
+## Static configuration
+tailnets:
+  corp:
+    stateDir: /var/lib/traefik/tsnet/corp
+    routes:
+      - 100.64.30.0/24
+
+entryPoints:
+  vip:
+    address: "100.64.30.5:443"
+    tailnet: corp
+```
+
+```toml tab="File (TOML)"
+## Static configuration
+[tailnets.corp]
+  stateDir = "/var/lib/traefik/tsnet/corp"
+  routes = ["100.64.30.0/24"]
+
+[entryPoints.vip]
+  address = "100.64.30.5:443"
+  tailnet = "corp"
+```
+
+An advertised route still has to be approved, by an admin or by an ACL
+auto-approver, before the tailnet sends any traffic over it.
+
+!!! warning "This is not a subnet router"
+
+    Traefik answers on an advertised address only where an entryPoint binds
+    it. The embedded node accepts packets for an advertised prefix but has
+    nothing to forward them with, so traffic to an address no entryPoint binds
+    is dropped rather than passed to the host behind it.
+
+    Give the entryPoint an explicit address inside the route, as above. An
+    entryPoint written as `:443` binds the node's own addresses only, not the
+    advertised ones. For genuine subnet routing, run a `tailscaled` subnet
+    router beside Traefik.
+
+Because the routes exist only while the node is joined, a tailnet that
+advertises any is brought up at startup even when no entryPoint or
+serversTransport references it. That happens in the background with the same
+retry as everything else here, so it never delays startup.
+
+## Hosting Tailscale Services
+
+A [Tailscale Service](https://tailscale.com/kb/1552/tailscale-services) has its
+own name and virtual IPs, separate from any node's. `services` declares the
+Services a tailnet node may host, and an entryPoint hosts one by naming it:
+
+```yaml tab="File (YAML)"
+## Static configuration
+tailnets:
+  corp:
+    stateDir: /var/lib/traefik/tsnet/corp
+    # Only tagged nodes may host a Service.
+    advertiseTags:
+      - tag:proxy
+    services:
+      myapp:
+        # Defaults to svc:myapp
+        name: svc:myapp
+
+entryPoints:
+  web:
+    address: ":80"
+    tailnet: corp
+    tailnetService: myapp
+
+  websecure:
+    address: ":443"
+    tailnet: corp
+    tailnetService: myapp
+```
+
+```toml tab="File (TOML)"
+## Static configuration
+[tailnets.corp]
+  stateDir = "/var/lib/traefik/tsnet/corp"
+  advertiseTags = ["tag:proxy"]
+  [tailnets.corp.services.myapp]
+    name = "svc:myapp"
+
+[entryPoints.web]
+  address = ":80"
+  tailnet = "corp"
+  tailnetService = "myapp"
+
+[entryPoints.websecure]
+  address = ":443"
+  tailnet = "corp"
+  tailnetService = "myapp"
+```
+
+Such an entryPoint accepts the Service's traffic instead of traffic addressed
+to the node, so clients reach `myapp.<tailnet>.ts.net` rather than this
+particular Traefik. A Service spanning several ports is expressed by naming it
+on one entryPoint per port, as above; the port advertised is the entryPoint's
+own, so the two cannot disagree.
+
+Hosting a Service requires:
+
+- the node to be **tagged** (`advertiseTags`), which Traefik checks at startup
+  rather than leaving to the first connection;
+- the advertisement to be **approved** in the tailnet, by an admin or an ACL
+  auto-approver;
+- the entryPoint to name a **port**, so `:0` is refused.
+
+### Client addresses on a Service
+
+Tailscale delivers a Service's traffic to a loopback socket that Traefik
+listens on, rather than to the tailnet address directly. Without a PROXY
+protocol header every connection would appear to come from `127.0.0.1`, and
+the client's tailnet address would be lost to access logs, IP allow-lists and
+`X-Forwarded-For` alike.
+
+`proxyProtocol` therefore defaults to version `2`, and Traefik reads the header
+itself; nothing needs configuring on the entryPoint. Set it to `0` to turn it
+off, accepting that the client address goes with it.
+
+The entryPoint's own `proxyProtocol` option is refused on a Service entryPoint.
+It decides which *peers* to trust a header from, and the only peer here is
+Tailscale's local forwarder, so it has nothing to judge.
+
+!!! info "What a Service entryPoint cannot do"
+
+    A Service is forwarded as TCP, so `http3` on a Service entryPoint and
+    `tailnetService` on a UDP entryPoint are both refused at startup. Use a
+    plain tailnet entryPoint for those.
 
 ## Backends over a Tailnet
 

@@ -112,6 +112,10 @@ func NewTCPEntryPoints(entryPointsConfig static.EntryPoints, hostResolverConfig 
 	}
 
 	serverEntryPointsTCP := make(TCPEntryPoints)
+	// Tracks which Tailscale Services actually get hosted, so the ones that
+	// were configured and forgotten can be called out.
+	hostedServices := make(map[string]map[string]struct{})
+
 	for entryPointName, config := range entryPointsConfig {
 		protocol, err := config.GetProtocol()
 		if err != nil {
@@ -132,7 +136,17 @@ func NewTCPEntryPoints(entryPointsConfig static.EntryPoints, hostResolverConfig 
 		if err != nil {
 			return nil, fmt.Errorf("error while building entryPoint %s: %w", entryPointName, err)
 		}
+
+		if config.TailnetService != "" {
+			if hostedServices[config.Tailnet] == nil {
+				hostedServices[config.Tailnet] = map[string]struct{}{}
+			}
+			hostedServices[config.Tailnet][config.TailnetService] = struct{}{}
+		}
 	}
+
+	tailnets.LogUnhostedServices(hostedServices)
+
 	return serverEntryPointsTCP, nil
 }
 

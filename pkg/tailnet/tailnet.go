@@ -222,6 +222,28 @@ func (r *Registry) Start(ctx context.Context) {
 	}
 }
 
+// LogUnhostedServices warns about Services that are configured but that no
+// entryPoint hosts. Hosting is what advertises a Service, so one nothing
+// references is inert, which is easy to write and hard to notice.
+func (r *Registry) LogUnhostedServices(hosted map[string]map[string]struct{}) {
+	if r == nil {
+		return
+	}
+
+	for name, node := range r.nodes {
+		for key, svc := range node.services {
+			if _, ok := hosted[name][key]; ok {
+				continue
+			}
+
+			log.Warn().
+				Str("tailnet", name).
+				Str("service", svc.name.String()).
+				Msgf("Tailscale Service %q is configured but no entryPoint hosts it; set tailnetService on an entryPoint to advertise it", key)
+		}
+	}
+}
+
 // Close shuts down every node that was started.
 func (r *Registry) Close() {
 	if r == nil {
@@ -330,7 +352,10 @@ func (n *Node) ListenService(name string, port uint16) (net.Listener, error) {
 	// precisely because nothing else can reach this socket.
 	return &proxyproto.Listener{
 		Listener: listener,
-		Policy: func(net.Addr) (proxyproto.Policy, error) {
+		ConnPolicy: func(proxyproto.ConnPolicyOptions) (proxyproto.Policy, error) {
+			// REQUIRE, not USE: we asked Tailscale for a header, so a
+			// connection without one did not come through the Service and
+			// has no business being served as though it had.
 			return proxyproto.REQUIRE, nil
 		},
 	}, nil

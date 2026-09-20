@@ -44,6 +44,8 @@ type ServersTransportTCPSpec struct {
 	TerminationDelay *intstr.IntOrString `json:"terminationDelay,omitempty"`
 	// TLS defines the TLS configuration
 	TLS *TLSClientConfig `json:"tls,omitempty"`
+	// Tailnet defines the name of a tailnet from the static configuration to dial the backend servers over, instead of over the host network.
+	Tailnet string `json:"tailnet,omitempty"`
 }
 
 // TLSClientConfig defines the desired state of a TLSClientConfig.

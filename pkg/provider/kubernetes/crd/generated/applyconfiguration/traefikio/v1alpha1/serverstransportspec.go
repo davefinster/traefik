@@ -68,6 +68,8 @@ type ServersTransportSpecApplyConfiguration struct {
 	PeerCertSANs []tls.SAN `json:"peerCertSANs,omitempty"`
 	// Spiffe defines the SPIFFE configuration.
 	Spiffe *dynamic.Spiffe `json:"spiffe,omitempty"`
+	// Tailnet defines the name of a tailnet from the static configuration to dial the backend servers over, instead of over the host network.
+	Tailnet *string `json:"tailnet,omitempty"`
 }
 
 // ServersTransportSpecApplyConfiguration constructs a declarative configuration of the ServersTransportSpec type for use with
@@ -198,5 +200,13 @@ func (b *ServersTransportSpecApplyConfiguration) WithPeerCertSANs(values ...tls.
 // If called multiple times, the Spiffe field is set to the value of the last call.
 func (b *ServersTransportSpecApplyConfiguration) WithSpiffe(value dynamic.Spiffe) *ServersTransportSpecApplyConfiguration {
 	b.Spiffe = &value
+	return b
+}
+
+// WithTailnet sets the Tailnet field in the declarative configuration to the given value
+// and returns the receiver, so that objects can be built by chaining "With" function invocations.
+// If called multiple times, the Tailnet field is set to the value of the last call.
+func (b *ServersTransportSpecApplyConfiguration) WithTailnet(value string) *ServersTransportSpecApplyConfiguration {
+	b.Tailnet = &value
 	return b
 }

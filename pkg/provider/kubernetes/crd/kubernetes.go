@@ -574,6 +574,7 @@ func (p *Provider) loadConfigurationFromCRD(ctx context.Context, client Client) 
 			PeerCertURI:         serversTransport.Spec.PeerCertURI,
 			PeerCertSANs:        serversTransport.Spec.PeerCertSANs,
 			Spiffe:              serversTransport.Spec.Spiffe,
+			Tailnet:             serversTransport.Spec.Tailnet,
 		})
 	}
 
@@ -607,6 +608,8 @@ func (p *Provider) loadConfigurationFromCRD(ctx context.Context, client Client) 
 		if serversTransportTCP.Spec.ProxyProtocol != nil {
 			tcpServerTransport.ProxyProtocol = serversTransportTCP.Spec.ProxyProtocol
 		}
+
+		tcpServerTransport.Tailnet = serversTransportTCP.Spec.Tailnet
 
 		if serversTransportTCP.Spec.TLS != nil {
 			if len(serversTransportTCP.Spec.TLS.RootCAsSecrets) > 0 {

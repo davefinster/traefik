@@ -72,6 +72,11 @@ spec:
                     minimum: 1
                     type: integer
                 type: object
+              tailnet:
+                description: Tailnet defines the name of a tailnet from the static
+                  configuration to dial the backend servers over, instead of over
+                  the host network.
+                type: string
               terminationDelay:
                 anyOf:
                 - type: integer

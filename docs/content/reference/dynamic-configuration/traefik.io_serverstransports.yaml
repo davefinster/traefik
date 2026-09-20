@@ -211,6 +211,11 @@ spec:
                     description: TrustDomain defines the allowed SPIFFE trust domain.
                     type: string
                 type: object
+              tailnet:
+                description: Tailnet defines the name of a tailnet from the static
+                  configuration to dial the backend servers over, instead of over
+                  the host network.
+                type: string
             type: object
         required:
         - metadata

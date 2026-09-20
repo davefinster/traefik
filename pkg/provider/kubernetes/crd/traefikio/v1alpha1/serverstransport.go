@@ -61,6 +61,8 @@ type ServersTransportSpec struct {
 	PeerCertSANs []traefiktls.SAN `json:"peerCertSANs,omitempty"`
 	// Spiffe defines the SPIFFE configuration.
 	Spiffe *dynamic.Spiffe `json:"spiffe,omitempty"`
+	// Tailnet defines the name of a tailnet from the static configuration to dial the backend servers over, instead of over the host network.
+	Tailnet string `json:"tailnet,omitempty"`
 }
 
 // +k8s:deepcopy-gen=true

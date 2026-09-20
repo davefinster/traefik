@@ -46,6 +46,8 @@ type ServersTransportTCPSpecApplyConfiguration struct {
 	TerminationDelay *intstr.IntOrString `json:"terminationDelay,omitempty"`
 	// TLS defines the TLS configuration
 	TLS *TLSClientConfigApplyConfiguration `json:"tls,omitempty"`
+	// Tailnet defines the name of a tailnet from the static configuration to dial the backend servers over, instead of over the host network.
+	Tailnet *string `json:"tailnet,omitempty"`
 }
 
 // ServersTransportTCPSpecApplyConfiguration constructs a declarative configuration of the ServersTransportTCPSpec type for use with
@@ -91,5 +93,13 @@ func (b *ServersTransportTCPSpecApplyConfiguration) WithTerminationDelay(value i
 // If called multiple times, the TLS field is set to the value of the last call.
 func (b *ServersTransportTCPSpecApplyConfiguration) WithTLS(value *TLSClientConfigApplyConfiguration) *ServersTransportTCPSpecApplyConfiguration {
 	b.TLS = value
+	return b
+}
+
+// WithTailnet sets the Tailnet field in the declarative configuration to the given value
+// and returns the receiver, so that objects can be built by chaining "With" function invocations.
+// If called multiple times, the Tailnet field is set to the value of the last call.
+func (b *ServersTransportTCPSpecApplyConfiguration) WithTailnet(value string) *ServersTransportTCPSpecApplyConfiguration {
+	b.Tailnet = &value
 	return b
 }

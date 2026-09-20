@@ -286,6 +286,11 @@ Hosting a Service requires:
   auto-approver;
 - the entryPoint to name a **port**, so `:0` is refused.
 
+With `terminateTLS`, Tailscale terminates TLS itself and the entryPoint
+receives plaintext, so the routers on it must not also expect TLS. Left off, as
+it is by default, the connection arrives encrypted and Traefik terminates it
+with its own certificates and TLS options, exactly as on any other entryPoint.
+
 ### Client addresses on a Service
 
 Tailscale delivers a Service's traffic to a loopback socket that Traefik
@@ -307,6 +312,19 @@ Tailscale's local forwarder, so it has nothing to judge.
     A Service is forwarded as TCP, so `http3` on a Service entryPoint and
     `tailnetService` on a UDP entryPoint are both refused at startup. Use a
     plain tailnet entryPoint for those.
+
+    Tailscale's **TUN mode** for Services, which would carry the Service's
+    virtual IPs as raw L3 traffic rather than as forwarded TCP, is not
+    available here. `tsnet` does not implement it
+    ([tailscale/corp#35859](https://github.com/tailscale/tailscale)), and the
+    embedded node could not serve it if it did: a Service in TUN mode
+    registers no TCP handler, so nothing delivers its packets to a userspace
+    node without a real TUN device.
+
+    Where the aim is an address on the tailnet that Traefik answers on, use
+    [routes](#advertising-routes) with an entryPoint bound to an address
+    inside the advertised prefix. That covers the ports Traefik serves, which
+    for a reverse proxy is the traffic that matters.
 
 ## Backends over a Tailnet
 

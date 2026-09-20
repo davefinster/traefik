@@ -109,6 +109,8 @@ type Configuration struct {
 
 	Spiffe *SpiffeClientConfig `description:"SPIFFE integration configuration." json:"spiffe,omitempty" toml:"spiffe,omitempty" yaml:"spiffe,omitempty" export:"true"`
 
+	Tailnets map[string]*Tailnet `description:"Embedded Tailscale (tsnet) nodes that entryPoints can listen on and serversTransports can dial backends over, by the name they reference." json:"tailnets,omitempty" toml:"tailnets,omitempty" yaml:"tailnets,omitempty" export:"true"`
+
 	OCSP *tls.OCSPConfig `description:"OCSP configuration." json:"ocsp,omitempty" toml:"ocsp,omitempty" yaml:"ocsp,omitempty" label:"allowEmpty" file:"allowEmpty" export:"true"`
 }
 

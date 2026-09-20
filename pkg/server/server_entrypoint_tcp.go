@@ -33,6 +33,7 @@ import (
 	"github.com/traefik/traefik/v3/pkg/safe"
 	tcprouter "github.com/traefik/traefik/v3/pkg/server/router/tcp"
 	"github.com/traefik/traefik/v3/pkg/server/service"
+	"github.com/traefik/traefik/v3/pkg/tailnet"
 	"github.com/traefik/traefik/v3/pkg/tcp"
 	"github.com/traefik/traefik/v3/pkg/types"
 )
@@ -103,7 +104,7 @@ func (h *httpForwarder) Close() error {
 type TCPEntryPoints map[string]*TCPEntryPoint
 
 // NewTCPEntryPoints creates a new TCPEntryPoints.
-func NewTCPEntryPoints(entryPointsConfig static.EntryPoints, hostResolverConfig *types.HostResolverConfig, metricsRegistry metrics.Registry) (TCPEntryPoints, error) {
+func NewTCPEntryPoints(entryPointsConfig static.EntryPoints, hostResolverConfig *types.HostResolverConfig, metricsRegistry metrics.Registry, tailnets *tailnet.Registry) (TCPEntryPoints, error) {
 	if os.Getenv(debugConnectionEnv) != "" {
 		expvar.Publish("clientConnectionStates", expvar.Func(func() any {
 			return clientConnectionStates
@@ -127,7 +128,7 @@ func NewTCPEntryPoints(entryPointsConfig static.EntryPoints, hostResolverConfig 
 			OpenConnectionsGauge().
 			With("entrypoint", entryPointName, "protocol", "TCP")
 
-		serverEntryPointsTCP[entryPointName], err = NewTCPEntryPoint(ctx, entryPointName, config, hostResolverConfig, openConnectionsGauge)
+		serverEntryPointsTCP[entryPointName], err = NewTCPEntryPoint(ctx, entryPointName, config, hostResolverConfig, openConnectionsGauge, tailnets)
 		if err != nil {
 			return nil, fmt.Errorf("error while building entryPoint %s: %w", entryPointName, err)
 		}
@@ -180,10 +181,10 @@ type TCPEntryPoint struct {
 }
 
 // NewTCPEntryPoint creates a new TCPEntryPoint.
-func NewTCPEntryPoint(ctx context.Context, name string, config *static.EntryPoint, hostResolverConfig *types.HostResolverConfig, openConnectionsGauge gokitmetrics.Gauge) (*TCPEntryPoint, error) {
+func NewTCPEntryPoint(ctx context.Context, name string, config *static.EntryPoint, hostResolverConfig *types.HostResolverConfig, openConnectionsGauge gokitmetrics.Gauge, tailnets *tailnet.Registry) (*TCPEntryPoint, error) {
 	tracker := newConnectionTracker(openConnectionsGauge)
 
-	listener, err := buildListener(ctx, name, config)
+	listener, err := buildListener(ctx, name, config, tailnets)
 	if err != nil {
 		return nil, fmt.Errorf("building listener: %w", err)
 	}
@@ -211,7 +212,7 @@ func NewTCPEntryPoint(ctx context.Context, name string, config *static.EntryPoin
 		return nil, fmt.Errorf("creating HTTPS server: %w", err)
 	}
 
-	h3Server, err := newHTTP3Server(ctx, name, config, httpsServer)
+	h3Server, err := newHTTP3Server(ctx, name, config, httpsServer, tailnets)
 	if err != nil {
 		return nil, fmt.Errorf("creating HTTP3 server: %w", err)
 	}
@@ -256,7 +257,7 @@ func (e *TCPEntryPoint) Start(ctx context.Context) {
 	logger.Debug().Msg("Starting TCP Server")
 
 	if e.http3Server != nil {
-		go func() { _ = e.http3Server.Start() }()
+		go func() { _ = e.http3Server.Start(ctx) }()
 	}
 
 	for {
@@ -422,14 +423,26 @@ func (c *writeCloserWrapper) CloseWrite() error {
 func writeCloser(conn net.Conn) (tcp.WriteCloser, error) {
 	switch typedConn := conn.(type) {
 	case *proxyproto.Conn:
-		underlying, ok := typedConn.TCPConn()
-		if !ok {
-			return nil, errors.New("underlying connection is not a tcp connection")
+		if underlying, ok := typedConn.TCPConn(); ok {
+			return &writeCloserWrapper{writeCloser: underlying, Conn: typedConn}, nil
 		}
-		return &writeCloserWrapper{writeCloser: underlying, Conn: typedConn}, nil
+		// On a tailnet entryPoint the wrapped connection is a userspace
+		// netstack conn rather than a *net.TCPConn, but it still closes its
+		// write half.
+		if underlying, ok := typedConn.Raw().(tcp.WriteCloser); ok {
+			return &writeCloserWrapper{writeCloser: underlying, Conn: typedConn}, nil
+		}
+		return nil, errors.New("underlying connection is not a tcp connection")
 	case *net.TCPConn:
 		return typedConn, nil
 	default:
+		// Connections accepted on a tailnet entryPoint come from the
+		// in-process userspace network stack, not from a host socket. They
+		// are not *net.TCPConn, but they do implement CloseWrite, which is
+		// all the TCP proxying path needs.
+		if writeCloser, ok := conn.(tcp.WriteCloser); ok {
+			return writeCloser, nil
+		}
 		return nil, fmt.Errorf("unknown connection type %T", typedConn)
 	}
 }
@@ -508,7 +521,40 @@ func (oc *onceCloseListener) Close() error {
 	return oc.closeErr
 }
 
-func buildListener(ctx context.Context, name string, config *static.EntryPoint) (net.Listener, error) {
+// buildTailnetListener returns a listener that accepts on the entryPoint's
+// tailnet instead of on the host network. It does not wait for the tailnet:
+// the listener binds on its first Accept and retries until it can, so a
+// tailnet that is slow or unreachable at boot costs only its own entryPoint.
+func buildTailnetListener(ctx context.Context, config *static.EntryPoint, tailnets *tailnet.Registry) (net.Listener, error) {
+	node, err := tailnets.Node(config.Tailnet)
+	if err != nil {
+		return nil, err
+	}
+
+	if config.ReusePort {
+		// The listener is a socket on the in-process network stack, so there
+		// is no host socket for SO_REUSEPORT to apply to, and nothing for a
+		// second process to share.
+		return nil, errors.New("reusePort is not supported on a tailnet entryPoint")
+	}
+
+	var listener net.Listener = node.LazyListen(ctx, "tcp", config.GetAddress())
+
+	if config.ProxyProtocol != nil {
+		listener, err = buildProxyProtocolListener(ctx, config, listener)
+		if err != nil {
+			return nil, fmt.Errorf("error creating proxy protocol listener: %w", err)
+		}
+	}
+
+	return &onceCloseListener{Listener: listener}, nil
+}
+
+func buildListener(ctx context.Context, name string, config *static.EntryPoint, tailnets *tailnet.Registry) (net.Listener, error) {
+	if config.Tailnet != "" {
+		return buildTailnetListener(ctx, config, tailnets)
+	}
+
 	var listener net.Listener
 	var err error
 

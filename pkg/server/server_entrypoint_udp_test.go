@@ -23,7 +23,7 @@ func TestShutdownUDPConn(t *testing.T) {
 	}
 	ep.SetDefaults()
 
-	entryPoint, err := NewUDPEntryPoint(&ep, "")
+	entryPoint, err := NewUDPEntryPoint(&ep, "", nil)
 	require.NoError(t, err)
 
 	go entryPoint.Start(t.Context())
@@ -47,7 +47,7 @@ func TestShutdownUDPConn(t *testing.T) {
 		}
 	}))
 
-	conn, err := net.Dial("udp", entryPoint.listener.Addr().String())
+	conn, err := net.Dial("udp", entryPoint.listeners[0].Addr().String())
 	require.NoError(t, err)
 
 	// Start sending packets, to create a "session" with the server.
@@ -69,7 +69,7 @@ func TestShutdownUDPConn(t *testing.T) {
 	requireEcho(t, "TEST2", conn, time.Second)
 
 	// And make sure that on the other hand, opening new sessions is not possible anymore.
-	conn2, err := net.Dial("udp", entryPoint.listener.Addr().String())
+	conn2, err := net.Dial("udp", entryPoint.listeners[0].Addr().String())
 	require.NoError(t, err)
 
 	_, err = conn2.Write([]byte("TEST"))

@@ -576,6 +576,7 @@ type ServersTransport struct {
 	PeerCertURI  string           `description:"Defines the URI used to match against SAN URI during the peer certificate verification." json:"peerCertURI,omitempty" toml:"peerCertURI,omitempty" yaml:"peerCertURI,omitempty"`
 	PeerCertSANs []traefiktls.SAN `description:"Defines the SANs (Subject Alternative Names) used to match against SANs during the peer certificate verification." json:"peerCertSANs,omitempty" toml:"peerCertSANs,omitempty" yaml:"peerCertSANs,omitempty"`
 	Spiffe       *Spiffe          `description:"Defines the SPIFFE configuration." json:"spiffe,omitempty" toml:"spiffe,omitempty" yaml:"spiffe,omitempty" label:"allowEmpty" file:"allowEmpty" export:"true"`
+	Tailnet      string           `description:"Dials the backend servers over the named tailnet from the static configuration, instead of over the host network." json:"tailnet,omitempty" toml:"tailnet,omitempty" yaml:"tailnet,omitempty" export:"true"`
 }
 
 // +k8s:deepcopy-gen=true

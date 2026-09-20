@@ -11,6 +11,7 @@ import (
 	"github.com/traefik/traefik/v3/pkg/observability/metrics"
 	"github.com/traefik/traefik/v3/pkg/safe"
 	"github.com/traefik/traefik/v3/pkg/server/middleware"
+	"github.com/traefik/traefik/v3/pkg/tailnet"
 )
 
 // Server is the reverse-proxy/load-balancer engine.
@@ -20,6 +21,11 @@ type Server struct {
 	udpEntryPoints   UDPEntryPoints
 	observabilityMgr *middleware.ObservabilityMgr
 
+	// tailnets owns the embedded Tailscale nodes that tailnet entryPoints
+	// listen on and tailnet serversTransports dial through. Nil when none
+	// are configured.
+	tailnets *tailnet.Registry
+
 	signals  chan os.Signal
 	stopChan chan bool
 
@@ -27,7 +33,7 @@ type Server struct {
 }
 
 // NewServer returns an initialized Server.
-func NewServer(routinesPool *safe.Pool, entryPoints TCPEntryPoints, entryPointsUDP UDPEntryPoints, watcher *ConfigurationWatcher, observabilityMgr *middleware.ObservabilityMgr) *Server {
+func NewServer(routinesPool *safe.Pool, entryPoints TCPEntryPoints, entryPointsUDP UDPEntryPoints, watcher *ConfigurationWatcher, observabilityMgr *middleware.ObservabilityMgr, tailnets *tailnet.Registry) *Server {
 	srv := &Server{
 		watcher:          watcher,
 		tcpEntryPoints:   entryPoints,
@@ -36,6 +42,7 @@ func NewServer(routinesPool *safe.Pool, entryPoints TCPEntryPoints, entryPointsU
 		stopChan:         make(chan bool, 1),
 		routinesPool:     routinesPool,
 		udpEntryPoints:   entryPointsUDP,
+		tailnets:         tailnets,
 	}
 
 	srv.configureSignals()
@@ -98,6 +105,10 @@ func (s *Server) Close() {
 	close(s.stopChan)
 
 	s.observabilityMgr.Close()
+
+	// Last: the tailnet nodes back the entryPoint listeners that have just
+	// been shut down, and the transports that dialed backends over them.
+	s.tailnets.Close()
 
 	cancel()
 }

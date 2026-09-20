@@ -1076,7 +1076,7 @@ func TestConnectionTimeoutsAreDefined(t *testing.T) {
 			ctx, cancel := context.WithTimeout(t.Context(), time.Second)
 			defer cancel()
 
-			conn, err := customDialContext(dialer, cfg)(ctx, "tcp", ln.Addr().String())
+			conn, err := customDialContext(dialer.DialContext, cfg)(ctx, "tcp", ln.Addr().String())
 			require.NoError(t, err)
 			require.NotNil(t, conn)
 			defer conn.Close()

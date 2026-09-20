@@ -2,13 +2,16 @@ package server
 
 import (
 	"context"
+	"errors"
 	"fmt"
+	"net"
 	"sync"
 	"time"
 
 	"github.com/rs/zerolog/log"
 	"github.com/traefik/traefik/v3/pkg/config/static"
 	"github.com/traefik/traefik/v3/pkg/observability/logs"
+	"github.com/traefik/traefik/v3/pkg/tailnet"
 	"github.com/traefik/traefik/v3/pkg/udp"
 )
 
@@ -16,7 +19,7 @@ import (
 type UDPEntryPoints map[string]*UDPEntryPoint
 
 // NewUDPEntryPoints returns all the UDP entry points, keyed by name.
-func NewUDPEntryPoints(config static.EntryPoints) (UDPEntryPoints, error) {
+func NewUDPEntryPoints(config static.EntryPoints, tailnets *tailnet.Registry) (UDPEntryPoints, error) {
 	entryPoints := make(UDPEntryPoints)
 	for entryPointName, entryPoint := range config {
 		protocol, err := entryPoint.GetProtocol()
@@ -28,7 +31,7 @@ func NewUDPEntryPoints(config static.EntryPoints) (UDPEntryPoints, error) {
 			continue
 		}
 
-		ep, err := NewUDPEntryPoint(entryPoint, entryPointName)
+		ep, err := NewUDPEntryPoint(entryPoint, entryPointName, tailnets)
 		if err != nil {
 			return nil, fmt.Errorf("error while building entryPoint %s: %w", entryPointName, err)
 		}
@@ -75,17 +78,49 @@ func (eps UDPEntryPoints) Switch(handlers map[string]udp.Handler) {
 
 // UDPEntryPoint is an entry point where we listen for UDP packets.
 type UDPEntryPoint struct {
-	listener               *udp.Listener
 	switcher               *udp.HandlerSwitcher
 	transportConfiguration *static.EntryPointsTransport
+
+	// A tailnet entryPoint binds in Start rather than here: tsnet needs a
+	// concrete address per packet conn, which the node only has once it has
+	// joined, and it holds one for each address family. Host entryPoints
+	// bind a single listener at construction, as before.
+	tailnetNode *tailnet.Node
+	address     string
+	timeout     time.Duration
+
+	mu        sync.Mutex
+	listeners []*udp.Listener
+	closed    bool
+	done      chan struct{}
 }
 
 // NewUDPEntryPoint returns a UDP entry point.
-func NewUDPEntryPoint(config *static.EntryPoint, name string) (*UDPEntryPoint, error) {
+func NewUDPEntryPoint(config *static.EntryPoint, name string, tailnets *tailnet.Registry) (*UDPEntryPoint, error) {
 	var listener *udp.Listener
 	var err error
 
 	timeout := time.Duration(config.UDP.Timeout)
+
+	ep := &UDPEntryPoint{
+		switcher:               &udp.HandlerSwitcher{},
+		transportConfiguration: config.Transport,
+		address:                config.GetAddress(),
+		timeout:                timeout,
+		done:                   make(chan struct{}),
+	}
+
+	if config.Tailnet != "" {
+		if config.ReusePort {
+			return nil, errors.New("reusePort is not supported on a tailnet entryPoint")
+		}
+
+		ep.tailnetNode, err = tailnets.Node(config.Tailnet)
+		if err != nil {
+			return nil, err
+		}
+		return ep, nil
+	}
 
 	// if we have predefined connections from socket activation
 	if socketActivation.isEnabled() {
@@ -107,14 +142,80 @@ func NewUDPEntryPoint(config *static.EntryPoint, name string) (*UDPEntryPoint, e
 		}
 	}
 
-	return &UDPEntryPoint{listener: listener, switcher: &udp.HandlerSwitcher{}, transportConfiguration: config.Transport}, nil
+	ep.listeners = []*udp.Listener{listener}
+	return ep, nil
 }
 
 // Start commences the listening for ep.
 func (ep *UDPEntryPoint) Start(ctx context.Context) {
 	log.Ctx(ctx).Debug().Msg("Start UDP Server")
+
+	listeners, err := ep.bind(ctx)
+	if err != nil {
+		return
+	}
+
+	// A tailnet entryPoint holds one listener per tailnet address, all
+	// feeding the same handler switcher.
+	var wg sync.WaitGroup
+	for _, listener := range listeners {
+		wg.Go(func() { ep.accept(listener) })
+	}
+	wg.Wait()
+}
+
+// bind returns the listeners to accept on, opening them on the tailnet first
+// if this entryPoint is bound to one. It retries until the tailnet answers,
+// so a tailnet that is not up at boot does not take the entryPoint with it.
+func (ep *UDPEntryPoint) bind(ctx context.Context) ([]*udp.Listener, error) {
+	ep.mu.Lock()
+	switch {
+	case ep.closed:
+		ep.mu.Unlock()
+		return nil, net.ErrClosed
+	case ep.listeners != nil:
+		listeners := ep.listeners
+		ep.mu.Unlock()
+		return listeners, nil
+	}
+	ep.mu.Unlock()
+
+	conns, err := ep.tailnetNode.RetryListenPacketAll(ctx, "udp", ep.address, ep.done)
+	if err != nil {
+		return nil, err
+	}
+
+	listeners := make([]*udp.Listener, 0, len(conns))
+	for _, conn := range conns {
+		listener, err := udp.ListenPacketConn(conn, ep.timeout)
+		if err != nil {
+			log.Ctx(ctx).Error().Err(err).Msg("Error creating tailnet UDP listener")
+			continue
+		}
+		listeners = append(listeners, listener)
+	}
+
+	ep.mu.Lock()
+	defer ep.mu.Unlock()
+	if ep.closed {
+		for _, listener := range listeners {
+			_ = listener.Shutdown(0)
+		}
+		return nil, net.ErrClosed
+	}
+	ep.listeners = listeners
+
+	log.Ctx(ctx).Info().
+		Str("tailnet", ep.tailnetNode.Name()).
+		Int("listeners", len(listeners)).
+		Msg("Listening for UDP on tailnet")
+
+	return listeners, nil
+}
+
+func (ep *UDPEntryPoint) accept(listener *udp.Listener) {
 	for {
-		conn, err := ep.listener.Accept()
+		conn, err := listener.Accept()
 		if err != nil {
 			// Only errClosedListener can happen that's why we return
 			return
@@ -136,9 +237,20 @@ func (ep *UDPEntryPoint) Shutdown(ctx context.Context) {
 		time.Sleep(reqAcceptGraceTimeOut)
 	}
 
+	ep.mu.Lock()
+	if !ep.closed {
+		ep.closed = true
+		// Releases a bind still waiting for the tailnet to come up.
+		close(ep.done)
+	}
+	listeners := ep.listeners
+	ep.mu.Unlock()
+
 	graceTimeOut := time.Duration(ep.transportConfiguration.LifeCycle.GraceTimeOut)
-	if err := ep.listener.Shutdown(graceTimeOut); err != nil {
-		logger.Error().Err(err).Send()
+	for _, listener := range listeners {
+		if err := listener.Shutdown(graceTimeOut); err != nil {
+			logger.Error().Err(err).Send()
+		}
 	}
 }
 

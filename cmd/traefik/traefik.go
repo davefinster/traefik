@@ -46,6 +46,7 @@ import (
 	"github.com/traefik/traefik/v3/pkg/server"
 	"github.com/traefik/traefik/v3/pkg/server/middleware"
 	"github.com/traefik/traefik/v3/pkg/server/service"
+	"github.com/traefik/traefik/v3/pkg/tailnet"
 	"github.com/traefik/traefik/v3/pkg/tcp"
 	traefiktls "github.com/traefik/traefik/v3/pkg/tls"
 	"github.com/traefik/traefik/v3/pkg/version"
@@ -224,14 +225,24 @@ func setupServer(staticConfiguration *static.Configuration) (*server.Server, err
 	tracer, tracerCloser := setupTracing(ctx, staticConfiguration.Tracing)
 	observabilityMgr := middleware.NewObservabilityMgr(*staticConfiguration, metricsRegistry, semConvMetricRegistry, accessLog, tracer, tracerCloser)
 
+	// Tailnets
+
+	// Built before the entryPoints, which take listeners from it, and before
+	// the transport managers, which dial backends through it. No node is
+	// started here: each joins on its first use.
+	tailnets, err := tailnet.NewRegistry(staticConfiguration.Tailnets)
+	if err != nil {
+		return nil, fmt.Errorf("creating tailnet registry: %w", err)
+	}
+
 	// Entrypoints
 
-	serverEntryPointsTCP, err := server.NewTCPEntryPoints(staticConfiguration.EntryPoints, staticConfiguration.HostResolver, metricsRegistry)
+	serverEntryPointsTCP, err := server.NewTCPEntryPoints(staticConfiguration.EntryPoints, staticConfiguration.HostResolver, metricsRegistry, tailnets)
 	if err != nil {
 		return nil, err
 	}
 
-	serverEntryPointsUDP, err := server.NewUDPEntryPoints(staticConfiguration.EntryPoints)
+	serverEntryPointsUDP, err := server.NewUDPEntryPoints(staticConfiguration.EntryPoints, tailnets)
 	if err != nil {
 		return nil, err
 	}
@@ -302,6 +313,7 @@ func setupServer(staticConfiguration *static.Configuration) (*server.Server, err
 	}
 
 	transportManager := service.NewTransportManager(spiffeX509Source)
+	transportManager.SetTailnetDialer(tailnets)
 
 	var proxyBuilder service.ProxyBuilder = httputil.NewProxyBuilder(transportManager, semConvMetricRegistry)
 	if staticConfiguration.Experimental != nil && staticConfiguration.Experimental.FastProxy != nil {
@@ -309,6 +321,7 @@ func setupServer(staticConfiguration *static.Configuration) (*server.Server, err
 	}
 
 	dialerManager := tcp.NewDialerManager(spiffeX509Source)
+	dialerManager.SetTailnetDialer(tailnets)
 	acmeHTTPHandler := getHTTPChallengeHandler(acmeProviders, httpChallengeProvider)
 	managerFactory := service.NewManagerFactory(*staticConfiguration, routinesPool, observabilityMgr, transportManager, proxyBuilder, acmeHTTPHandler, tlsManager)
 
@@ -400,7 +413,7 @@ func setupServer(staticConfiguration *static.Configuration) (*server.Server, err
 		}
 	})
 
-	return server.NewServer(routinesPool, serverEntryPointsTCP, serverEntryPointsUDP, watcher, observabilityMgr), nil
+	return server.NewServer(routinesPool, serverEntryPointsTCP, serverEntryPointsUDP, watcher, observabilityMgr, tailnets), nil
 }
 
 func getHTTPChallengeHandler(acmeProviders []*acme.Provider, httpChallengeProvider http.Handler) http.Handler {

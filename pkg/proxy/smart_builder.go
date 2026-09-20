@@ -54,7 +54,11 @@ func (b *SmartBuilder) Build(configName string, targetURL *url.URL, passHostHead
 	// The fast proxy implementation cannot handle HTTP/2 requests for now.
 	// For the https scheme we cannot guess if the backend communication will use HTTP2,
 	// thus we check if HTTP/2 is disabled to use the fast proxy implementation when this is possible.
-	if targetURL.Scheme == "h2c" || (targetURL.Scheme == "https" && !serversTransport.DisableHTTP2) {
+	//
+	// The fast proxy also dials with its own net.Dialer, which would bypass a
+	// tailnet-bound transport and reach the backend over the host network, so
+	// those always take the httputil proxy.
+	if serversTransport.Tailnet != "" || targetURL.Scheme == "h2c" || (targetURL.Scheme == "https" && !serversTransport.DisableHTTP2) {
 		return b.proxyBuilder.Build(configName, targetURL, passHostHeader, preservePath, flushInterval)
 	}
 	return b.fastProxyBuilder.Build(configName, targetURL, passHostHeader, preservePath)

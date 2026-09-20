@@ -46,6 +46,7 @@ type EntryPoint struct {
 	Address          string                `description:"Entry point address." json:"address,omitempty" toml:"address,omitempty" yaml:"address,omitempty"`
 	AllowACMEByPass  bool                  `description:"Enables handling of ACME TLS and HTTP challenges with custom routers." json:"allowACMEByPass,omitempty" toml:"allowACMEByPass,omitempty" yaml:"allowACMEByPass,omitempty"`
 	ReusePort        bool                  `description:"Enables EntryPoints from the same or different processes listening on the same TCP/UDP port." json:"reusePort,omitempty" toml:"reusePort,omitempty" yaml:"reusePort,omitempty"`
+	Tailnet          string                `description:"Accepts connections on the named tailnet from the static configuration, instead of on the host network." json:"tailnet,omitempty" toml:"tailnet,omitempty" yaml:"tailnet,omitempty" export:"true"`
 	AsDefault        bool                  `description:"Adds this EntryPoint to the list of default EntryPoints to be used on routers that don't have any Entrypoint defined." json:"asDefault,omitempty" toml:"asDefault,omitempty" yaml:"asDefault,omitempty"`
 	Transport        *EntryPointsTransport `description:"Configures communication between clients and Traefik." json:"transport,omitempty" toml:"transport,omitempty" yaml:"transport,omitempty" export:"true"`
 	ProxyProtocol    *ProxyProtocol        `description:"Proxy-Protocol configuration." json:"proxyProtocol,omitempty" toml:"proxyProtocol,omitempty" yaml:"proxyProtocol,omitempty" label:"allowEmpty" file:"allowEmpty" export:"true"`

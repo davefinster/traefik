@@ -30,6 +30,14 @@ type SpiffeX509Source interface {
 	x509bundle.Source
 }
 
+// TailnetDialer dials over a named tailnet. It is implemented by
+// tailnet.Registry, which cannot be imported here: it depends on the static
+// configuration, whose dependency tree loops back into this package.
+type TailnetDialer interface {
+	DialContext(ctx context.Context, tailnet, network, addr string) (net.Conn, error)
+	Has(tailnet string) bool
+}
+
 // TransportManager handles transports for backend communication.
 type TransportManager struct {
 	rtLock        sync.RWMutex
@@ -38,6 +46,7 @@ type TransportManager struct {
 	tlsConfigs    map[string]*tls.Config
 
 	spiffeX509Source SpiffeX509Source
+	tailnetDialer    TailnetDialer
 }
 
 // NewTransportManager creates a new TransportManager.
@@ -48,6 +57,14 @@ func NewTransportManager(spiffeX509Source SpiffeX509Source) *TransportManager {
 		tlsConfigs:       make(map[string]*tls.Config),
 		spiffeX509Source: spiffeX509Source,
 	}
+}
+
+// SetTailnetDialer sets the registry that transports with a tailnet option
+// dial through. It must be called before the first Update. A nil dialer is
+// valid: every tailnet dial then fails with a configuration error, rather
+// than silently going out over the host network.
+func (t *TransportManager) SetTailnetDialer(dialer TailnetDialer) {
+	t.tailnetDialer = dialer
 }
 
 // Update updates the transport configurations.
@@ -281,9 +298,29 @@ func (c connWithTimeouts) Write(b []byte) (n int, err error) {
 	return n, nil
 }
 
-func customDialContext(d *net.Dialer, cfg *dynamic.ForwardingTimeouts) func(ctx context.Context, network string, address string) (net.Conn, error) {
+type dialContextFunc func(ctx context.Context, network, address string) (net.Conn, error)
+
+// tailnetDialContext adapts a tailnet dial to a plain dial context, applying
+// the dial timeout that net.Dialer would otherwise own.
+func tailnetDialContext(dialer TailnetDialer, tailnet string, timeout time.Duration) dialContextFunc {
 	return func(ctx context.Context, network, address string) (net.Conn, error) {
-		conn, err := d.DialContext(ctx, network, address)
+		if dialer == nil {
+			return nil, fmt.Errorf("dialing %q over tailnet %q: no tailnets configured", address, tailnet)
+		}
+
+		if timeout > 0 {
+			var cancel context.CancelFunc
+			ctx, cancel = context.WithTimeout(ctx, timeout)
+			defer cancel()
+		}
+
+		return dialer.DialContext(ctx, tailnet, network, address)
+	}
+}
+
+func customDialContext(dial dialContextFunc, cfg *dynamic.ForwardingTimeouts) dialContextFunc {
+	return func(ctx context.Context, network, address string) (net.Conn, error) {
+		conn, err := dial(ctx, network, address)
 
 		if cfg.ReadTimeout <= 0 && cfg.WriteTimeout <= 0 {
 			return conn, err
@@ -316,9 +353,22 @@ func (t *TransportManager) createRoundTripper(cfg *dynamic.ServersTransport, tls
 		dialer.Timeout = time.Duration(cfg.ForwardingTimeouts.DialTimeout)
 	}
 
+	dialContext := dialContextFunc(dialer.DialContext)
+	if cfg.Tailnet != "" {
+		// A dial over an unknown tailnet fails on use rather than at build
+		// time: falling back to the default dialer here would quietly send
+		// the traffic over the host network instead, which is the one
+		// outcome a tailnet-bound transport must never have.
+		if t.tailnetDialer == nil || !t.tailnetDialer.Has(cfg.Tailnet) {
+			log.Warn().Msgf("ServersTransport references tailnet %q, which is not in the static configuration; requests through it will fail", cfg.Tailnet)
+		}
+
+		dialContext = tailnetDialContext(t.tailnetDialer, cfg.Tailnet, dialer.Timeout)
+	}
+
 	transport := &http.Transport{
 		Proxy:                 http.ProxyFromEnvironment,
-		DialContext:           dialer.DialContext,
+		DialContext:           dialContext,
 		MaxIdleConnsPerHost:   cfg.MaxIdleConnsPerHost,
 		IdleConnTimeout:       90 * time.Second,
 		TLSHandshakeTimeout:   10 * time.Second,
@@ -331,7 +381,7 @@ func (t *TransportManager) createRoundTripper(cfg *dynamic.ServersTransport, tls
 	if cfg.ForwardingTimeouts != nil {
 		transport.ResponseHeaderTimeout = time.Duration(cfg.ForwardingTimeouts.ResponseHeaderTimeout)
 		transport.IdleConnTimeout = time.Duration(cfg.ForwardingTimeouts.IdleConnTimeout)
-		transport.DialContext = customDialContext(dialer, cfg.ForwardingTimeouts)
+		transport.DialContext = customDialContext(dialContext, cfg.ForwardingTimeouts)
 		// The forwarding timeout names come from the x/net/http2.Transport fields (ReadIdleTimeout/PingTimeout),
 		// which were used to configure the HTTP/2 health checks before the net/http native support (Go 1.24).
 		// HTTP2Config.SendPingTimeout carries the same semantics as ReadIdleTimeout:

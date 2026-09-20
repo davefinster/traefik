@@ -165,7 +165,9 @@ func (a *api) mintAuthKey(ctx context.Context, tags []string) (string, error) {
 	in.Capabilities.Devices.Create.Preauthorized = true
 	in.Capabilities.Devices.Create.Tags = tags
 	in.ExpirySeconds = 3600
-	in.Description = "traefik tailnet VIP harness (ephemeral, 1h)"
+	// Tailscale rejects punctuation in a key description, so this stays
+	// alphanumeric, spaces and hyphens.
+	in.Description = "traefik tailnetvip harness ephemeral"
 
 	var out struct {
 		Key string `json:"key"`

@@ -16,14 +16,17 @@ package main
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"flag"
 	"fmt"
 	"os"
 	"os/signal"
+	"sort"
 	"strings"
 	"syscall"
 
+	"github.com/tailscale/hujson"
 	"tailscale.com/tailcfg"
 )
 
@@ -39,6 +42,7 @@ func run() error {
 		serviceName = flag.String("service", "svc:traefik-vip-harness", "Tailscale Service to create and host")
 		tag         = flag.String("tag", "tag:traefik-vip-harness", "ACL tag the harness nodes carry")
 		keep        = flag.Bool("keep", false, "leave the Service in place on exit, for inspection")
+		showPolicy  = flag.Bool("policy", false, "print the tailnet policy's tag and service grants, then exit")
 		only        = flag.String("only", "", "run only the named variant")
 	)
 	flag.Parse()
@@ -65,6 +69,10 @@ func run() error {
 		return err
 	}
 	fmt.Println("[ok] exchanged OAuth client for an API token")
+
+	if *showPolicy {
+		return describePolicy(ctx, api)
+	}
 
 	if err := checkPolicy(ctx, api, svc, *tag); err != nil {
 		return err
@@ -264,4 +272,62 @@ func wrap(s string, width int) string {
 		line += len(word)
 	}
 	return out.String()
+}
+
+// describePolicy prints the parts of the tailnet policy that decide whether
+// the harness can run: which tags exist and who owns them, and which
+// services are auto-approved for which tags.
+func describePolicy(ctx context.Context, api *api) error {
+	policy, err := api.acl(ctx)
+	if err != nil {
+		return fmt.Errorf("reading tailnet policy: %w", err)
+	}
+
+	stripped, err := hujson.Standardize([]byte(policy))
+	if err != nil {
+		return fmt.Errorf("parsing policy: %w", err)
+	}
+
+	var doc struct {
+		TagOwners     map[string][]string `json:"tagOwners"`
+		AutoApprovers struct {
+			Services map[string][]string `json:"services"`
+			Routes   map[string][]string `json:"routes"`
+		} `json:"autoApprovers"`
+	}
+	if err := json.Unmarshal(stripped, &doc); err != nil {
+		return fmt.Errorf("decoding policy: %w", err)
+	}
+
+	fmt.Println("tagOwners:")
+	for _, tag := range sortedKeys(doc.TagOwners) {
+		fmt.Printf("  %-46s %v\n", tag, doc.TagOwners[tag])
+	}
+
+	fmt.Println("\nautoApprovers.services:")
+	if len(doc.AutoApprovers.Services) == 0 {
+		fmt.Println("  (none)")
+	}
+	for _, svc := range sortedKeys(doc.AutoApprovers.Services) {
+		fmt.Printf("  %-46s %v\n", svc, doc.AutoApprovers.Services[svc])
+	}
+
+	fmt.Println("\nautoApprovers.routes:")
+	if len(doc.AutoApprovers.Routes) == 0 {
+		fmt.Println("  (none)")
+	}
+	for _, r := range sortedKeys(doc.AutoApprovers.Routes) {
+		fmt.Printf("  %-46s %v\n", r, doc.AutoApprovers.Routes[r])
+	}
+
+	return nil
+}
+
+func sortedKeys[V any](m map[string]V) []string {
+	out := make([]string, 0, len(m))
+	for k := range m {
+		out = append(out, k)
+	}
+	sort.Strings(out)
+	return out
 }

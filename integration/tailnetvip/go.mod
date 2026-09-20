@@ -6,7 +6,10 @@ module tailnetvip
 
 go 1.26.6
 
-require tailscale.com v1.102.4
+require (
+	github.com/tailscale/hujson v0.0.0-20260302212456-ecc657c15afd
+	tailscale.com v1.102.4
+)
 
 require (
 	filippo.io/edwards25519 v1.2.0 // indirect
@@ -33,7 +36,6 @@ require (
 	github.com/safchain/ethtool v0.3.0 // indirect
 	github.com/tailscale/certstore v0.1.1-0.20260409135935-3638fb84b77d // indirect
 	github.com/tailscale/go-winio v0.0.0-20231025203758-c4f33415bf55 // indirect
-	github.com/tailscale/hujson v0.0.0-20260302212456-ecc657c15afd // indirect
 	github.com/tailscale/peercred v0.0.0-20250107143737-35a0c7bd7edc // indirect
 	github.com/tailscale/web-client-prebuilt v0.0.0-20250124233751-d4cd19a26976 // indirect
 	github.com/tailscale/wireguard-go v0.0.0-20260715223240-2e01ba5b00f0 // indirect

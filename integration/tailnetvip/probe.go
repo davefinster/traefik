@@ -46,8 +46,29 @@ func serveUDPEcho(pc net.PacketConn) {
 	}
 }
 
-// probeTCP dials the VIP from the client node and checks the echo.
+// probeTCP dials the VIP from the client node and checks the echo, retrying
+// while the client's netmap catches up: the grant and the Service's addresses
+// reach it a round after the host advertises, and a single dial would read
+// that delay as a failure.
 func probeTCP(ctx context.Context, client *node, target netip.AddrPort) (bool, error) {
+	var lastErr error
+	deadline := time.Now().Add(propagationWindow)
+	for attempt := 1; time.Now().Before(deadline); attempt++ {
+		ok, err := probeTCPOnce(ctx, client, target)
+		if ok {
+			return true, nil
+		}
+		lastErr = fmt.Errorf("attempt %d: %w", attempt, err)
+		select {
+		case <-time.After(5 * time.Second):
+		case <-ctx.Done():
+			return false, ctx.Err()
+		}
+	}
+	return false, lastErr
+}
+
+func probeTCPOnce(ctx context.Context, client *node, target netip.AddrPort) (bool, error) {
 	conn, err := client.dialTCP(ctx, target.String(), probeTimeout)
 	if err != nil {
 		return false, fmt.Errorf("dial: %w", err)
@@ -71,6 +92,10 @@ func probeTCP(ctx context.Context, client *node, target netip.AddrPort) (bool, e
 	return true, nil
 }
 
+// propagationWindow bounds how long a probe keeps retrying while control
+// distributes the netmap that makes the Service reachable.
+const propagationWindow = 90 * time.Second
+
 // probeUDP sends a datagram to the VIP from the client node and waits for the
 // echo. UDP gives no connection error, so a failure here shows up as a
 // timeout, which is exactly what a dropped or unrouted datagram looks like.
@@ -88,7 +113,8 @@ func probeUDP(ctx context.Context, client *node, target netip.AddrPort) (bool, e
 	// Retry: the first datagram after a netmap change is easily lost, and a
 	// single drop would read as "UDP does not work".
 	var lastErr error
-	for attempt := range 3 {
+	deadline := time.Now().Add(propagationWindow)
+	for attempt := 0; time.Now().Before(deadline); attempt++ {
 		if _, err := conn.Write(probePayload); err != nil {
 			lastErr = fmt.Errorf("write: %w", err)
 			continue
@@ -108,4 +134,30 @@ func probeUDP(ctx context.Context, client *node, target netip.AddrPort) (bool, e
 		return true, nil
 	}
 	return false, lastErr
+}
+
+// probeNodeToNode checks the plainest thing that must work: the client
+// reaching a listener on the host's own tailnet address. If this fails, the
+// tailnet itself is the problem and no VIP result means anything.
+func probeNodeToNode(ctx context.Context, host, client *node) (bool, error) {
+	ln, err := host.srv.Listen("tcp", ":18443")
+	if err != nil {
+		return false, fmt.Errorf("host listen: %w", err)
+	}
+	defer ln.Close()
+	go serveTCPEcho(ln)
+
+	st, err := host.lc.Status(ctx)
+	if err != nil {
+		return false, err
+	}
+	if st.Self == nil || len(st.Self.TailscaleIPs) == 0 {
+		return false, fmt.Errorf("host has no tailnet address")
+	}
+
+	// Retried like the VIP probe: first contact between two nodes has to
+	// find a path (direct or DERP), and a single dial reads that setup as a
+	// failure.
+	target := netip.AddrPortFrom(st.Self.TailscaleIPs[0], 18443)
+	return probeTCP(ctx, client, target)
 }

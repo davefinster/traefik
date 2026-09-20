@@ -79,6 +79,25 @@ type result struct {
 	udpOK    bool
 	udpErr   error
 	setupErr error
+
+	// nodeToNode records whether the client can reach the host on its own
+	// tailnet address, which tells a VIP problem apart from a tailnet one.
+	nodeToNodeOK  bool
+	nodeToNodeErr error
+}
+
+// reset returns the host to a blank slate: no serve configuration and no
+// advertisement. A variant that inherited either would be testing the
+// previous one — and tailscaled refuses outright to move a Service between
+// TUN mode and TCP handlers without passing through empty.
+func reset(ctx context.Context, host *node, svc tailcfg.ServiceName) error {
+	if err := host.unadvertiseService(ctx, svc); err != nil {
+		return fmt.Errorf("withdrawing advertisement: %w", err)
+	}
+	if err := host.clearServeConfig(ctx); err != nil {
+		return fmt.Errorf("clearing serve config: %w", err)
+	}
+	return nil
 }
 
 // run configures the host for the variant and probes it from the client.
@@ -117,7 +136,7 @@ func (v variant) run(ctx context.Context, host, client *node, svc tailcfg.Servic
 		return res
 	}
 
-	vips, err := host.awaitServiceVIPs(ctx, svc, 60*time.Second)
+	vips, err := host.awaitServiceVIPs(ctx, svc, 90*time.Second)
 	if err != nil {
 		res.setupErr = err
 		return res
@@ -138,9 +157,6 @@ func (v variant) run(ctx context.Context, host, client *node, svc tailcfg.Servic
 			go serveUDPEcho(pc)
 		}
 	}
-
-	// Give control a moment to distribute the updated netmap to the client.
-	time.Sleep(5 * time.Second)
 
 	target := vips[0]
 	if v.tcpPort != 0 {

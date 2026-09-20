@@ -40,8 +40,8 @@ func main() {
 func run() error {
 	var (
 		serviceName = flag.String("service", "svc:traefik-vip-harness", "Tailscale Service to create and host")
-		hostTag     = flag.String("host-tag", "tag:traefik-vip-harness", "ACL tag the host node carries; must be in autoApprovers.services for the Service")
-		clientTag   = flag.String("client-tag", "", "ACL tag the client node carries; must be granted access to the Service. Defaults to -host-tag")
+		hostTags    = flag.String("host-tags", "tag:traefik-vip-harness", "comma-separated ACL tags for the host node. One must be in autoApprovers.services for the Service, and one must be reachable from the client's tag, or the host never enters the client's netmap and even its VIP cannot be resolved")
+		clientTag   = flag.String("client-tag", "", "ACL tag the client node carries; must be granted access to the Service. Defaults to the first host tag")
 		keep        = flag.Bool("keep", false, "leave the Service in place on exit, for inspection")
 		showPolicy  = flag.Bool("policy", false, "print the tailnet policy's tag and service grants, then exit")
 		only        = flag.String("only", "", "run only the named variant")
@@ -62,12 +62,19 @@ func run() error {
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 
+	hostTagList := strings.Split(*hostTags, ",")
+	for i := range hostTagList {
+		hostTagList[i] = strings.TrimSpace(hostTagList[i])
+	}
+	if len(hostTagList) == 0 || hostTagList[0] == "" {
+		return errors.New("-host-tags must name at least one tag")
+	}
 	if *clientTag == "" {
-		*clientTag = *hostTag
+		*clientTag = hostTagList[0]
 	}
 
 	fmt.Println("== Tailscale Service VIP harness ==")
-	fmt.Printf("service: %s\nhost tag: %s   client tag: %s\n\n", svc, *hostTag, *clientTag)
+	fmt.Printf("service: %s\nhost tags: %v   client tag: %s\n\n", svc, hostTagList, *clientTag)
 
 	api, err := newAPI(ctx, clientID, clientSecret)
 	if err != nil {
@@ -79,22 +86,19 @@ func run() error {
 		return describePolicy(ctx, api)
 	}
 
-	if err := checkPolicy(ctx, api, svc, *hostTag); err != nil {
+	if err := checkPolicy(ctx, api, svc, hostTagList[0]); err != nil {
 		return err
 	}
 
-	hostKey, err := api.mintAuthKey(ctx, []string{*hostTag})
+	hostKey, err := api.mintAuthKey(ctx, hostTagList)
 	if err != nil {
-		return fmt.Errorf("minting host auth key (is %s owned by the OAuth client's tag in tagOwners?): %w", *hostTag, err)
+		return fmt.Errorf("minting host auth key (are %v owned by the OAuth client's tag in tagOwners?): %w", hostTagList, err)
 	}
-	clientKey := hostKey
-	if *clientTag != *hostTag {
-		clientKey, err = api.mintAuthKey(ctx, []string{*clientTag})
-		if err != nil {
-			return fmt.Errorf("minting client auth key for %s: %w", *clientTag, err)
-		}
+	clientKey, err := api.mintAuthKey(ctx, []string{*clientTag})
+	if err != nil {
+		return fmt.Errorf("minting client auth key for %s: %w", *clientTag, err)
 	}
-	fmt.Printf("[ok] minted ephemeral auth keys for %s and %s\n", *hostTag, *clientTag)
+	fmt.Printf("[ok] minted ephemeral auth keys for %v and %s\n", hostTagList, *clientTag)
 
 	stateDir, err := os.MkdirTemp("", "tailnetvip-*")
 	if err != nil {
@@ -103,7 +107,7 @@ func run() error {
 	defer os.RemoveAll(stateDir)
 
 	fmt.Println("[..] bringing up host and client nodes")
-	host, err := startNode(ctx, stateDir+"/host", "vip-harness-host", hostKey, []string{*hostTag})
+	host, err := startNode(ctx, stateDir+"/host", "vip-harness-host", hostKey, hostTagList)
 	if err != nil {
 		return err
 	}
@@ -132,12 +136,16 @@ func run() error {
 
 		fmt.Printf("---- %s ----\n%s\n", v.name, wrap(v.desc, 76))
 
-		// Recreate the Service with this variant's declared ports.
+		// Each variant starts from a blank host and a Service carrying its
+		// own declared ports, so nothing carries over from the last one.
+		if err := reset(ctx, host, svc); err != nil {
+			return fmt.Errorf("resetting host before %s: %w", v.name, err)
+		}
 		_ = api.deleteService(ctx, svc.String())
 		if err := api.createService(ctx, vipService{
 			Name:    svc.String(),
 			Ports:   v.servicePorts,
-			Tags:    []string{*hostTag},
+			Tags:    hostTagList,
 			Comment: "ephemeral: created by the traefik tailnetvip harness",
 		}); err != nil {
 			return fmt.Errorf("creating Service for %s: %w", v.name, err)
@@ -203,6 +211,7 @@ func printResult(r result) {
 		return
 	}
 	fmt.Printf("  VIPs: %v\n", r.vips)
+	fmt.Printf("  node-to-node TCP  %s\n", outcome(r.nodeToNodeOK, r.nodeToNodeErr))
 	if r.variant.tcpPort != 0 {
 		fmt.Printf("  TCP :%d  %s\n", r.variant.tcpPort, outcome(r.tcpOK, r.tcpErr))
 	}

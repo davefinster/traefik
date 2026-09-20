@@ -143,6 +143,40 @@ func (n *node) advertiseService(ctx context.Context, svc tailcfg.ServiceName) er
 	return err
 }
 
+// unadvertiseService removes the Service from the node's advertised set. It
+// must happen before the Service is deleted and recreated, or the node keeps
+// claiming a Service that no longer exists and control never re-approves the
+// replacement.
+func (n *node) unadvertiseService(ctx context.Context, svc tailcfg.ServiceName) error {
+	prefs, err := n.lc.GetPrefs(ctx)
+	if err != nil {
+		return err
+	}
+
+	kept := make([]string, 0, len(prefs.AdvertiseServices))
+	for _, s := range prefs.AdvertiseServices {
+		if s != svc.String() {
+			kept = append(kept, s)
+		}
+	}
+	if len(kept) == len(prefs.AdvertiseServices) {
+		return nil
+	}
+
+	_, err = n.lc.EditPrefs(ctx, &ipn.MaskedPrefs{
+		AdvertiseServicesSet: true,
+		Prefs:                ipn.Prefs{AdvertiseServices: kept},
+	})
+	return err
+}
+
+// clearServeConfig empties the serve configuration. tailscaled refuses to
+// move a Service between TUN mode and TCP handlers in one write, so each
+// variant starts from nothing rather than from its predecessor.
+func (n *node) clearServeConfig(ctx context.Context) error {
+	return n.lc.SetServeConfig(ctx, &ipn.ServeConfig{})
+}
+
 // dialTCP connects to addr over this node's tailnet.
 func (n *node) dialTCP(ctx context.Context, addr string, timeout time.Duration) (net.Conn, error) {
 	ctx, cancel := context.WithTimeout(ctx, timeout)

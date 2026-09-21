@@ -44,6 +44,13 @@ func run() error {
 		clientTag   = flag.String("client-tag", "", "ACL tag the client node carries; must be granted access to the Service. Defaults to the first host tag")
 		keep        = flag.Bool("keep", false, "leave the Service in place on exit, for inspection")
 		showPolicy  = flag.Bool("policy", false, "print the tailnet policy's tag and service grants, then exit")
+		mintKeyPath = flag.String("mint-key", "", "mint an ephemeral auth key carrying -host-tags, write it to this path (0600), and exit")
+		ensureSvc   = flag.Bool("ensure-service", false, "create the Service with all ports (what TUN mode advertises) and exit")
+		deleteSvc   = flag.Bool("delete-service", false, "delete the Service and exit")
+		probeFQDN   = flag.String("probe", "", "skip the matrix: bring up only a client node and probe this Service, by MagicDNS name or bare Service name")
+		probeTCP    = flag.Int("probe-tcp", 0, "TCP port to probe with -probe")
+		probeUDP    = flag.Int("probe-udp", 0, "UDP port to probe with -probe")
+		tailnetDNS  = flag.String("tailnet-domain", "", "tailnet MagicDNS domain, used to complete a bare Service name for -probe")
 		only        = flag.String("only", "", "run only the named variant")
 	)
 	flag.Parse()
@@ -84,6 +91,38 @@ func run() error {
 
 	if *showPolicy {
 		return describePolicy(ctx, api)
+	}
+
+	if *mintKeyPath != "" {
+		return mintKey(ctx, api, hostTagList, *mintKeyPath)
+	}
+
+	if *deleteSvc {
+		if err := api.deleteService(ctx, svc.String()); err != nil {
+			return fmt.Errorf("deleting Service %s: %w", svc, err)
+		}
+		fmt.Printf("[ok] deleted %s\n", svc)
+		return nil
+	}
+
+	if *ensureSvc {
+		// All ports, because that is what a host in TUN mode advertises and
+		// control requires a host to cover everything the Service declares.
+		if err := api.createService(ctx, vipService{
+			Name:    svc.String(),
+			Ports:   []protoPort{"*"},
+			Tags:    hostTagList,
+			Comment: "created by the traefik tailnetvip harness",
+		}); err != nil {
+			return fmt.Errorf("creating Service %s: %w", svc, err)
+		}
+		fmt.Printf("[ok] created %s with all ports, tagged %v\n", svc, hostTagList)
+		return nil
+	}
+
+	if *probeFQDN != "" {
+		return probeService(ctx, api, *clientTag,
+			resolveFQDN(*probeFQDN, *tailnetDNS), uint16(*probeTCP), uint16(*probeUDP))
 	}
 
 	if err := checkPolicy(ctx, api, svc, hostTagList[0]); err != nil {

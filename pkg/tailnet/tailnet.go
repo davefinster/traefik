@@ -98,7 +98,24 @@ func NewRegistry(cfg map[string]*static.Tailnet) (*Registry, error) {
 			return nil, fmt.Errorf("tailnet %q: hosting a Tailscale Service requires advertiseTags: only tagged nodes may host one", name)
 		}
 
-		r.nodes[name] = &Node{name: name, cfg: tn, routes: routes, services: services}
+		node := &Node{name: name, cfg: tn, routes: routes, services: services}
+		for key, svc := range services {
+			if svc.cfg.Mode != static.TailnetServiceModeTUN {
+				continue
+			}
+			node.tun = true
+			// Taking delivery of a Service's packets means giving the node a
+			// network device, and a node with one stops absorbing subnet
+			// traffic into its own stack. Advertised routes would then go
+			// silently unanswered, so the combination is refused rather than
+			// half-working.
+			if len(routes) > 0 {
+				return nil, fmt.Errorf("tailnet %q: service %q is in %q mode, which cannot be combined with routes on the same tailnet; use a separate tailnet for either",
+					name, key, static.TailnetServiceModeTUN)
+			}
+		}
+
+		r.nodes[name] = node
 	}
 
 	return r, nil
@@ -155,6 +172,13 @@ func parseServices(services map[string]*static.TailnetService) (map[string]*serv
 
 		if cfg.ProxyProtocol < 0 || cfg.ProxyProtocol > 2 {
 			return nil, fmt.Errorf("service %q: proxyProtocol must be 0, 1 or 2, got %d", key, cfg.ProxyProtocol)
+		}
+
+		switch cfg.Mode {
+		case "", static.TailnetServiceModeTCP, static.TailnetServiceModeTUN:
+		default:
+			return nil, fmt.Errorf("service %q: unknown mode %q, want %q or %q",
+				key, cfg.Mode, static.TailnetServiceModeTCP, static.TailnetServiceModeTUN)
 		}
 
 		parsed[key] = &service{name: svcName, cfg: cfg}
@@ -272,8 +296,20 @@ type Node struct {
 	// control plane keeps it waiting, and Close must not queue behind it.
 	startMu sync.Mutex
 
+	// serveMu serializes read-modify-write of the node's serve
+	// configuration. Two entryPoints hosting Services on one node otherwise
+	// race, and the loser is rejected with an etag mismatch.
+	serveMu sync.Mutex
+
+	// tun is set when a Service on this tailnet is served in TUN mode, which
+	// is what makes the node hand its declined packets to an in-process
+	// stack rather than to a (fake) device that discards them.
+	tun bool
+
 	mu     sync.Mutex
 	srv    *tsnet.Server
+	dev    *memTUN
+	local  *localStack
 	closed bool
 }
 
@@ -305,6 +341,20 @@ func (n *Node) Listen(network, addr string) (net.Listener, error) {
 func (n *Node) HasService(name string) bool {
 	_, ok := n.services[name]
 	return ok
+}
+
+// ServiceMode returns how the named Service is served, which decides whether
+// an entryPoint takes it from Tailscale's serve configuration or from the
+// in-process stack. It returns "" for a Service that is not configured.
+func (n *Node) ServiceMode(name string) string {
+	svc, ok := n.services[name]
+	if !ok {
+		return ""
+	}
+	if svc.cfg.Mode == "" {
+		return static.TailnetServiceModeTCP
+	}
+	return svc.cfg.Mode
 }
 
 // ListenService announces the named Tailscale Service on the given port and
@@ -412,16 +462,24 @@ func (n *Node) Addrs(ctx context.Context) ([]netip.Addr, error) {
 // holds nothing to release, and tsnet panics on closing one.
 func (n *Node) Close() {
 	n.mu.Lock()
-	srv := n.srv
-	n.srv = nil
+	srv, dev, local := n.srv, n.dev, n.local
+	n.srv, n.dev, n.local = nil, nil, nil
 	n.closed = true
 	n.mu.Unlock()
 
-	if srv == nil {
-		return
+	if srv != nil {
+		if err := srv.Close(); err != nil {
+			log.Debug().Err(err).Str("tailnet", n.name).Msg("Closing tailnet node")
+		}
 	}
-	if err := srv.Close(); err != nil {
-		log.Debug().Err(err).Str("tailnet", n.name).Msg("Closing tailnet node")
+
+	// After the node: it writes into the device, so releasing the stack
+	// first would drop packets it is still handing over.
+	if local != nil {
+		local.close()
+	}
+	if dev != nil {
+		_ = dev.Close()
 	}
 }
 
@@ -507,7 +565,7 @@ func (n *Node) build() (*tsnet.Server, error) {
 
 	logger := log.With().Str("tailnet", n.name).Logger()
 
-	return &tsnet.Server{
+	srv := &tsnet.Server{
 		Hostname:      n.cfg.Hostname,
 		Dir:           n.cfg.StateDir,
 		AuthKey:       authKey,
@@ -521,7 +579,25 @@ func (n *Node) build() (*tsnet.Server, error) {
 		Logf: func(format string, args ...any) {
 			logger.Trace().Msgf(format, args...)
 		},
-	}, nil
+	}
+
+	if n.tun {
+		// With a device attached, tsnet keeps handling its own addresses
+		// (through registered gVisor endpoints) and releases everything else
+		// — the Service's virtual IPs among it — to the device.
+		dev := newMemTUN()
+		local, err := newLocalStack(dev)
+		if err != nil {
+			_ = dev.Close()
+			return nil, fmt.Errorf("tailnet %q: %w", n.name, err)
+		}
+
+		srv.Tun = dev
+		n.dev = dev
+		n.local = local
+	}
+
+	return srv, nil
 }
 
 // advertiseRoutes sets the node's advertised routes to exactly what the

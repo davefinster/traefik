@@ -165,3 +165,98 @@ func TestListenServiceUnknown(t *testing.T) {
 	_, err = node.ListenService("typo", 443)
 	require.ErrorContains(t, err, `unknown Service "typo"`)
 }
+
+func TestRegistryServiceModes(t *testing.T) {
+	testCases := []struct {
+		desc      string
+		mode      string
+		routes    []string
+		expectErr string
+		expect    string
+	}{
+		{
+			desc:   "unset defaults to tcp",
+			expect: static.TailnetServiceModeTCP,
+		},
+		{
+			desc:   "explicit tcp",
+			mode:   static.TailnetServiceModeTCP,
+			expect: static.TailnetServiceModeTCP,
+		},
+		{
+			desc:   "tun",
+			mode:   static.TailnetServiceModeTUN,
+			expect: static.TailnetServiceModeTUN,
+		},
+		{
+			desc:      "unknown mode",
+			mode:      "wireguard",
+			expectErr: `unknown mode "wireguard"`,
+		},
+		{
+			// A node given a device stops absorbing subnet traffic into its
+			// own stack, so advertised routes would go unanswered. Refused
+			// rather than half-working.
+			desc:      "tun cannot be combined with routes",
+			mode:      static.TailnetServiceModeTUN,
+			routes:    []string{"100.64.30.0/24"},
+			expectErr: "cannot be combined with routes",
+		},
+		{
+			desc:   "tcp mode coexists with routes",
+			mode:   static.TailnetServiceModeTCP,
+			routes: []string{"100.64.30.0/24"},
+			expect: static.TailnetServiceModeTCP,
+		},
+	}
+
+	for _, test := range testCases {
+		t.Run(test.desc, func(t *testing.T) {
+			t.Parallel()
+
+			registry, err := NewRegistry(map[string]*static.Tailnet{
+				"corp": {
+					StateDir:      t.TempDir(),
+					AdvertiseTags: []string{"tag:proxy"},
+					Routes:        test.routes,
+					Services:      map[string]*static.TailnetService{"myapp": {Mode: test.mode}},
+				},
+			})
+
+			if test.expectErr != "" {
+				require.ErrorContains(t, err, test.expectErr)
+				return
+			}
+			require.NoError(t, err)
+			t.Cleanup(registry.Close)
+
+			node, err := registry.Node("corp")
+			require.NoError(t, err)
+			assert.Equal(t, test.expect, node.ServiceMode("myapp"))
+			assert.Equal(t, test.expect == static.TailnetServiceModeTUN, node.tun)
+		})
+	}
+}
+
+// A Service in tcp mode must not be reachable through the TUN path, and vice
+// versa: the two take delivery of traffic in entirely different ways.
+func TestListenServiceTUNRejectsTCPModeService(t *testing.T) {
+	registry, err := NewRegistry(map[string]*static.Tailnet{
+		"corp": {
+			StateDir:      t.TempDir(),
+			AdvertiseTags: []string{"tag:proxy"},
+			Services:      map[string]*static.TailnetService{"myapp": {Mode: static.TailnetServiceModeTCP}},
+		},
+	})
+	require.NoError(t, err)
+	t.Cleanup(registry.Close)
+
+	node, err := registry.Node("corp")
+	require.NoError(t, err)
+
+	_, err = node.ListenServiceTUN(t.Context(), "myapp", 443)
+	require.ErrorContains(t, err, `is not in "tun" mode`)
+
+	_, err = node.ListenServiceTUN(t.Context(), "typo", 443)
+	require.ErrorContains(t, err, `unknown Service "typo"`)
+}

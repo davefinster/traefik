@@ -739,10 +739,12 @@ tailnets:
       - foobar
     services:
       Service0:
+        mode: foobar
         name: foobar
         terminateTLS: true
         proxyProtocol: 42
       Service1:
+        mode: foobar
         name: foobar
         terminateTLS: true
         proxyProtocol: 42
@@ -762,10 +764,12 @@ tailnets:
       - foobar
     services:
       Service0:
+        mode: foobar
         name: foobar
         terminateTLS: true
         proxyProtocol: 42
       Service1:
+        mode: foobar
         name: foobar
         terminateTLS: true
         proxyProtocol: 42

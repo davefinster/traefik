@@ -2,6 +2,7 @@ package tailnet
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"net"
 	"net/netip"
@@ -71,6 +72,34 @@ func (n *Node) RetryListenPacketAll(ctx context.Context, network, addr string, d
 		}
 
 		logger.Warn().Err(err).Str("retryIn", interval.String()).Msg("Cannot listen for packets on tailnet yet, retrying")
+
+		select {
+		case <-time.After(interval):
+		case <-done:
+			return nil, net.ErrClosed
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		}
+	}
+}
+
+// RetryListenServicePacketTUN keeps trying to accept a Service's UDP until it
+// succeeds, ctx is canceled, or done is closed. It is the packet twin of
+// LazyListenServiceTUN, and exists for the same reason: hosting a Service
+// depends on the tailnet, and an entryPoint must not wait for it at startup.
+func (n *Node) RetryListenServicePacketTUN(ctx context.Context, name string, port uint16, done <-chan struct{}) ([]net.PacketConn, error) {
+	logger := log.Ctx(ctx).With().Str("tailnet", n.name).Str("service", name).Logger()
+
+	for interval := retryInitialInterval; ; interval = min(interval*2, retryMaxInterval) {
+		conns, err := n.ListenServicePacketTUN(ctx, name, port)
+		if err == nil {
+			return conns, nil
+		}
+		if errors.Is(err, net.ErrClosed) {
+			return nil, net.ErrClosed
+		}
+
+		logger.Warn().Err(err).Str("retryIn", interval.String()).Msg("Cannot accept Service packets yet, retrying")
 
 		select {
 		case <-time.After(interval):

@@ -86,8 +86,12 @@ type UDPEntryPoint struct {
 	// joined, and it holds one for each address family. Host entryPoints
 	// bind a single listener at construction, as before.
 	tailnetNode *tailnet.Node
-	address     string
-	timeout     time.Duration
+	// tailnetService, when set, means the packets come from a Tailscale
+	// Service's addresses rather than the node's own.
+	tailnetService string
+	tailnetPort    uint16
+	address        string
+	timeout        time.Duration
 
 	mu        sync.Mutex
 	listeners []*udp.Listener
@@ -110,12 +114,6 @@ func NewUDPEntryPoint(config *static.EntryPoint, name string, tailnets *tailnet.
 		done:                   make(chan struct{}),
 	}
 
-	if config.TailnetService != "" {
-		// Tailscale Services are forwarded as TCP, so a UDP entryPoint has
-		// nothing to accept from one.
-		return nil, errors.New("tailnetService is not supported on a UDP entryPoint")
-	}
-
 	if config.Tailnet != "" {
 		if config.ReusePort {
 			return nil, errors.New("reusePort is not supported on a tailnet entryPoint")
@@ -125,7 +123,31 @@ func NewUDPEntryPoint(config *static.EntryPoint, name string, tailnets *tailnet.
 		if err != nil {
 			return nil, err
 		}
+
+		if config.TailnetService != "" {
+			if !ep.tailnetNode.HasService(config.TailnetService) {
+				return nil, fmt.Errorf("unknown Tailscale Service %q on tailnet %q", config.TailnetService, config.Tailnet)
+			}
+			// Only a Service in TUN mode carries UDP: Tailscale forwards a
+			// tcp-mode Service as TCP, so a UDP entryPoint would have
+			// nothing to accept from one.
+			if ep.tailnetNode.ServiceMode(config.TailnetService) != static.TailnetServiceModeTUN {
+				return nil, fmt.Errorf("tailscale Service %q must be in %q mode to carry UDP", config.TailnetService, static.TailnetServiceModeTUN)
+			}
+
+			port, err := entryPointPort(config)
+			if err != nil {
+				return nil, err
+			}
+			ep.tailnetService = config.TailnetService
+			ep.tailnetPort = port
+		}
+
 		return ep, nil
+	}
+
+	if config.TailnetService != "" {
+		return nil, errors.New("tailnetService requires the entryPoint to name a tailnet")
 	}
 
 	// if we have predefined connections from socket activation
@@ -220,7 +242,13 @@ func (ep *UDPEntryPoint) bind(ctx context.Context) ([]*udp.Listener, error) {
 	}
 	ep.mu.Unlock()
 
-	conns, err := ep.tailnetNode.RetryListenPacketAll(ctx, "udp", ep.address, ep.done)
+	var conns []net.PacketConn
+	var err error
+	if ep.tailnetService != "" {
+		conns, err = ep.tailnetNode.RetryListenServicePacketTUN(ctx, ep.tailnetService, ep.tailnetPort, ep.done)
+	} else {
+		conns, err = ep.tailnetNode.RetryListenPacketAll(ctx, "udp", ep.address, ep.done)
+	}
 	if err != nil {
 		return nil, err
 	}

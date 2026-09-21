@@ -90,6 +90,7 @@ entryPoints:
 | <a id="opt-tailnets-name-port" href="#opt-tailnets-name-port" title="#opt-tailnets-name-port">`tailnets.<name>.`<br />`port`</a> | Local UDP port for WireGuard and peer-to-peer traffic. <br /> Zero picks one automatically, which is what most deployments want; pin it when a firewall has to be opened for direct connections. | 0 | No |
 | <a id="opt-tailnets-name-routes" href="#opt-tailnets-name-routes" title="#opt-tailnets-name-routes">`tailnets.<name>.`<br />`routes`</a> | CIDR prefixes the node advertises into the tailnet, subject to approval by an admin or an ACL auto-approver. <br /> Traefik answers only on the addresses its entryPoints bind; this is not a subnet router. <br /> More information [here](#advertising-routes). | -     | No       |
 | <a id="opt-tailnets-name-services-name" href="#opt-tailnets-name-services-name" title="#opt-tailnets-name-services-name">`tailnets.<name>.`<br />`services.<name>`</a> | A Tailscale Service this node can host, keyed by the name entryPoints reference it as. <br /> More information [here](#hosting-tailscale-services). | -     | No       |
+| <a id="opt-tailnets-name-services-name-mode" href="#opt-tailnets-name-services-name-mode" title="#opt-tailnets-name-services-name-mode">`tailnets.<name>.`<br />`services.<name>.mode`</a> | How the Service is served: `tcp` (Tailscale forwards TCP to the entryPoint) or `tun` (Traefik takes the Service's packets directly). <br /> Only `tun` carries UDP, and only `tun` gives the entryPoint the client's real address without the PROXY protocol. <br /> More information [here](#serving-tcp-and-udp-on-one-service). | tcp   | No       |
 | <a id="opt-tailnets-name-services-name-name" href="#opt-tailnets-name-services-name-name" title="#opt-tailnets-name-services-name-name">`tailnets.<name>.`<br />`services.<name>.name`</a> | The Tailscale Service name, which must start with `svc:`. <br /> Defaults to `svc:` followed by the key the Service is configured under. | -     | No       |
 | <a id="opt-tailnets-name-services-name-terminateTLS" href="#opt-tailnets-name-services-name-terminateTLS" title="#opt-tailnets-name-services-name-terminateTLS">`tailnets.<name>.`<br />`services.<name>.terminateTLS`</a> | Lets Tailscale terminate TLS before forwarding to the entryPoint, in which case the Service's own fully-qualified name is the only permitted SNI. <br /> Off by default: TLS is Traefik's, as on any other entryPoint. | false | No       |
 | <a id="opt-tailnets-name-services-name-proxyProtocol" href="#opt-tailnets-name-services-name-proxyProtocol" title="#opt-tailnets-name-services-name-proxyProtocol">`tailnets.<name>.`<br />`services.<name>.proxyProtocol`</a> | The PROXY protocol version Tailscale uses when forwarding a connection to the entryPoint, or `0` to disable it. <br /> It carries the client's tailnet address, which is otherwise lost. <br /> More information [here](#client-addresses-on-a-service). | 2     | No       |
@@ -291,6 +292,82 @@ receives plaintext, so the routers on it must not also expect TLS. Left off, as
 it is by default, the connection arrives encrypted and Traefik terminates it
 with its own certificates and TLS options, exactly as on any other entryPoint.
 
+### Serving TCP and UDP on one Service
+
+A Service in the default `tcp` mode carries TCP only. That is not a choice
+Traefik makes: a host advertises UDP for a Service only in Tailscale's TUN
+mode, TUN mode forbids the TCP handlers that Tailscale forwards TCP through,
+and the two are mutually exclusive. One Service therefore cannot carry both
+through Tailscale's own forwarding.
+
+`mode: tun` sidesteps that by taking delivery of the Service's packets
+instead of having them forwarded:
+
+```yaml tab="File (YAML)"
+## Static configuration
+tailnets:
+  corp:
+    stateDir: /var/lib/traefik/tsnet/corp
+    advertiseTags:
+      - tag:proxy
+    services:
+      myapp:
+        mode: tun
+
+entryPoints:
+  websecure:
+    address: ":443"
+    tailnet: corp
+    tailnetService: myapp
+
+  dns:
+    address: ":53/udp"
+    tailnet: corp
+    tailnetService: myapp
+```
+
+```toml tab="File (TOML)"
+## Static configuration
+[tailnets.corp]
+  stateDir = "/var/lib/traefik/tsnet/corp"
+  advertiseTags = ["tag:proxy"]
+  [tailnets.corp.services.myapp]
+    mode = "tun"
+
+[entryPoints.websecure]
+  address = ":443"
+  tailnet = "corp"
+  tailnetService = "myapp"
+
+[entryPoints.dns]
+  address = ":53/udp"
+  tailnet = "corp"
+  tailnetService = "myapp"
+```
+
+In TUN mode the Service is advertised on every port and protocol, and
+Tailscale's own network stack stops handling its traffic — it releases the
+packets towards what would ordinarily be the operating system. Traefik puts
+an in-process network stack there instead, holding the Service's virtual IPs
+and answering on them. Nothing reaches the host: there is still no TUN
+device, no `NET_ADMIN` and no host routing.
+
+Two consequences follow, both improvements on `tcp` mode:
+
+- **Both protocols on one Service.** TCP and UDP entryPoints may name the
+  same Service, as above.
+- **Real client addresses.** The packets arrive as they were sent, so
+  connections carry the peer's tailnet address without the PROXY protocol,
+  and the entryPoint's own `proxyProtocol` option means what it usually does.
+  `services.<name>.proxyProtocol` applies to `tcp` mode only.
+
+!!! warning "A tailnet cannot combine TUN mode with routes"
+
+    Giving the node a network device also stops it absorbing subnet traffic
+    into its own stack, so [advertised routes](#advertising-routes) would go
+    unanswered. Configuring both on one tailnet is refused at startup. Use a
+    separate tailnet for either.
+
 ### Client addresses on a Service
 
 Tailscale delivers a Service's traffic to a loopback socket that Traefik
@@ -309,9 +386,10 @@ Tailscale's local forwarder, so it has nothing to judge.
 
 !!! info "What a Service entryPoint cannot do"
 
-    A Service is forwarded as TCP, so `http3` on a Service entryPoint and
-    `tailnetService` on a UDP entryPoint are both refused at startup. Use a
-    plain tailnet entryPoint for those.
+    In `tcp` mode a Service is forwarded as TCP, so `http3` on a Service
+    entryPoint and `tailnetService` on a UDP entryPoint are both refused at
+    startup. `mode: tun` lifts the UDP restriction; `http3` on a Service
+    entryPoint is still refused, and wants a plain tailnet entryPoint.
 
     Tailscale's **TUN mode** for Services, which would carry the Service's
     virtual IPs as raw L3 traffic rather than as forwarded TCP, is not

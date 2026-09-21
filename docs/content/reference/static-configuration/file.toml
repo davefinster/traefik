@@ -668,19 +668,23 @@
     port = 42
     routes = ["foobar", "foobar"]
     [tailnets.Tailnet1.services.Service0]
+      mode = "foobar"
       name = "foobar"
       terminateTLS = true
       proxyProtocol = 42
     [tailnets.Tailnet1.services.Service1]
+      mode = "foobar"
       name = "foobar"
       terminateTLS = true
       proxyProtocol = 42
     routes = ["foobar", "foobar"]
     [tailnets.Tailnet0.services.Service0]
+      mode = "foobar"
       name = "foobar"
       terminateTLS = true
       proxyProtocol = 42
     [tailnets.Tailnet0.services.Service1]
+      mode = "foobar"
       name = "foobar"
       terminateTLS = true
       proxyProtocol = 42

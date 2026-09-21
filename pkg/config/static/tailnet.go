@@ -76,6 +76,21 @@ func (t *Tailnet) SetDefaults() {}
 // Hosting a Service requires the node to be tagged (see AdvertiseTags), and
 // the advertisement to be approved by an admin or an ACL auto-approver.
 type TailnetService struct {
+	// Mode is how the Service is served.
+	//
+	// "tcp" (the default) forwards TCP to the entryPoint through Tailscale's
+	// own serve configuration. It carries TCP only, on the ports entryPoints
+	// name, and arrives over a loopback socket, so the client's address
+	// comes from the PROXY protocol header below.
+	//
+	// "tun" advertises the Service on every port and protocol and takes
+	// delivery of its packets directly, in an in-process network stack. It
+	// is the only way to serve TCP and UDP on one Service, and connections
+	// carry the peer's real address without the PROXY protocol. It changes
+	// how the whole node handles packets, so a tailnet hosting one cannot
+	// also advertise routes.
+	Mode string `description:"How the Service is served: tcp (Tailscale forwards TCP to the entryPoint) or tun (Traefik takes the Service's packets directly, carrying TCP and UDP)." json:"mode,omitempty" toml:"mode,omitempty" yaml:"mode,omitempty" export:"true"`
+
 	// Name is the Tailscale Service name, which must start with "svc:".
 	// Defaults to "svc:" followed by the key this Service is configured
 	// under.
@@ -97,7 +112,18 @@ type TailnetService struct {
 	ProxyProtocol int `description:"PROXY protocol version Tailscale uses to forward connections, carrying the client address. 0 disables it." json:"proxyProtocol,omitempty" toml:"proxyProtocol,omitempty" yaml:"proxyProtocol,omitempty" export:"true"`
 }
 
+// Service modes.
+const (
+	// TailnetServiceModeTCP forwards TCP through Tailscale's serve
+	// configuration. TCP only.
+	TailnetServiceModeTCP = "tcp"
+	// TailnetServiceModeTUN takes delivery of the Service's packets in an
+	// in-process network stack. TCP and UDP.
+	TailnetServiceModeTUN = "tun"
+)
+
 // SetDefaults sets the default values.
 func (t *TailnetService) SetDefaults() {
+	t.Mode = TailnetServiceModeTCP
 	t.ProxyProtocol = 2
 }

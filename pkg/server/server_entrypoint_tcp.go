@@ -563,18 +563,28 @@ func buildTailnetListener(ctx context.Context, config *static.EntryPoint, tailne
 			return nil, fmt.Errorf("unknown Tailscale Service %q on tailnet %q", config.TailnetService, config.Tailnet)
 		}
 
-		listener = node.LazyListenService(ctx, config.TailnetService, port)
+		if node.ServiceMode(config.TailnetService) == static.TailnetServiceModeTUN {
+			// The Service's packets are delivered to the in-process stack,
+			// so the connections carry the peer's real address and there is
+			// no loopback hop to reconstruct it across.
+			listener = node.LazyListenServiceTUN(ctx, config.TailnetService, port)
+		} else {
+			listener = node.LazyListenService(ctx, config.TailnetService, port)
+		}
 	} else {
 		listener = node.LazyListen(ctx, "tcp", config.GetAddress())
 	}
 
 	if config.ProxyProtocol != nil {
-		if config.TailnetService != "" {
-			// A Service reaches the entryPoint over a loopback socket, so the
-			// peer is never the client and a trusted-IP policy has nothing
-			// to judge. The Service's own proxyProtocol option carries the
-			// client address instead, and is read before we get here.
-			return nil, errors.New("proxyProtocol is not supported on a Tailscale Service entryPoint: use the Service's own proxyProtocol option")
+		if config.TailnetService != "" && node.ServiceMode(config.TailnetService) != static.TailnetServiceModeTUN {
+			// A Service forwarded by Tailscale reaches the entryPoint over a
+			// loopback socket, so the peer is never the client and a
+			// trusted-IP policy has nothing to judge. The Service's own
+			// proxyProtocol option carries the client address instead, and
+			// is read before we get here. A Service in TUN mode has no such
+			// hop: the peer is the client, so the option means what it
+			// usually means.
+			return nil, errors.New("proxyProtocol is not supported on a Tailscale Service entryPoint in tcp mode: use the Service's own proxyProtocol option, or mode tun")
 		}
 
 		listener, err = buildProxyProtocolListener(ctx, config, listener)

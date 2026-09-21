@@ -17,7 +17,10 @@ func testRegistry(t *testing.T) *tailnet.Registry {
 		"corp": {
 			StateDir:      t.TempDir(),
 			AdvertiseTags: []string{"tag:proxy"},
-			Services:      map[string]*static.TailnetService{"myapp": {}},
+			Services: map[string]*static.TailnetService{
+				"myapp":    {},
+				"bothprot": {Mode: static.TailnetServiceModeTUN},
+			},
 		},
 	})
 	require.NoError(t, err)
@@ -214,12 +217,56 @@ func TestTailnetServiceRejectsHTTP3(t *testing.T) {
 	require.ErrorContains(t, err, "http3 is not supported on a Tailscale Service entryPoint")
 }
 
-func TestTailnetServiceRejectedOnUDPEntryPoint(t *testing.T) {
+// Tailscale forwards a tcp-mode Service as TCP, so a UDP entryPoint has
+// nothing to accept from one.
+func TestTailnetTCPServiceRejectedOnUDPEntryPoint(t *testing.T) {
 	config := tailnetEntryPoint("corp")
 	config.Address = "127.0.0.1:8053/udp"
 	config.TailnetService = "myapp"
 	config.UDP = &static.UDPConfig{}
 
 	_, err := NewUDPEntryPoint(config, "dns", testRegistry(t))
-	require.ErrorContains(t, err, "tailnetService is not supported on a UDP entryPoint")
+	require.ErrorContains(t, err, `must be in "tun" mode to carry UDP`)
+}
+
+// A Service in TUN mode does carry UDP, which is the whole reason the mode
+// exists: its packets arrive at the in-process stack rather than being
+// forwarded as TCP.
+func TestTailnetTUNServiceAcceptedOnUDPEntryPoint(t *testing.T) {
+	config := tailnetEntryPoint("corp")
+	config.Address = "127.0.0.1:8053/udp"
+	config.TailnetService = "bothprot"
+	config.UDP = &static.UDPConfig{}
+
+	entryPoint, err := NewUDPEntryPoint(config, "dns", testRegistry(t))
+	require.NoError(t, err)
+	require.NotNil(t, entryPoint)
+}
+
+// The same Service name on a TCP entryPoint: one Service, both protocols,
+// which is what no tcp-mode Service can do.
+func TestTailnetTUNServiceAcceptedOnTCPEntryPoint(t *testing.T) {
+	config := tailnetEntryPoint("corp")
+	config.Address = "127.0.0.1:8443"
+	config.TailnetService = "bothprot"
+
+	listener, err := buildListener(t.Context(), "websecure", config, testRegistry(t))
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = listener.Close() })
+
+	assert.Equal(t, "bothprot:8443", listener.Addr().String())
+}
+
+// proxyProtocol is refused on a forwarded Service, where the peer is always
+// the loopback forwarder, but allowed in TUN mode, where the peer is the
+// client.
+func TestTailnetTUNServiceAllowsEntryPointProxyProtocol(t *testing.T) {
+	config := tailnetEntryPoint("corp")
+	config.Address = "127.0.0.1:8443"
+	config.TailnetService = "bothprot"
+	config.ProxyProtocol = &static.ProxyProtocol{Insecure: true}
+
+	listener, err := buildListener(t.Context(), "websecure", config, testRegistry(t))
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = listener.Close() })
 }

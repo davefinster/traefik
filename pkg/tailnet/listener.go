@@ -49,6 +49,21 @@ func (n *Node) LazyListenService(ctx context.Context, name string, port uint16) 
 	}
 }
 
+// LazyListenServiceTUN is LazyListen for a Service served in TUN mode.
+// Hosting one asks the most of the tailnet of anything here — the node must
+// have joined, be tagged, have its advertisement approved, and be given the
+// Service's addresses — so it is waited out on the retry rather than at
+// startup, like everything else.
+func (n *Node) LazyListenServiceTUN(ctx context.Context, name string, port uint16) net.Listener {
+	return &lazyListener{
+		node: n,
+		bind: func() (net.Listener, error) { return n.ListenServiceTUN(ctx, name, port) },
+		addr: serviceAddr{service: name, port: port},
+		ctx:  ctx,
+		done: make(chan struct{}),
+	}
+}
+
 type lazyListener struct {
 	node *Node
 	bind func() (net.Listener, error)

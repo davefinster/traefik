@@ -125,7 +125,11 @@ require (
 	sigs.k8s.io/yaml v1.6.0
 )
 
-require tailscale.com v1.102.4
+require (
+	github.com/tailscale/wireguard-go v0.0.0-20260715223240-2e01ba5b00f0
+	gvisor.dev/gvisor v0.0.0-20260224225140-573d5e7127a8
+	tailscale.com v1.102.4
+)
 
 require (
 	cloud.google.com/go/auth v0.23.2 // indirect
@@ -374,7 +378,6 @@ require (
 	github.com/tailscale/hujson v0.0.0-20260302212456-ecc657c15afd // indirect
 	github.com/tailscale/peercred v0.0.0-20250107143737-35a0c7bd7edc // indirect
 	github.com/tailscale/web-client-prebuilt v0.0.0-20250124233751-d4cd19a26976 // indirect
-	github.com/tailscale/wireguard-go v0.0.0-20260715223240-2e01ba5b00f0 // indirect
 	github.com/tencentcloud/tencentcloud-sdk-go/tencentcloud/common v1.3.170 // indirect
 	github.com/tidwall/match v1.1.1 // indirect
 	github.com/tidwall/pretty v1.2.1 // indirect
@@ -430,7 +433,6 @@ require (
 	gopkg.in/ini.v1 v1.67.3 // indirect
 	gopkg.in/ns1/ns1-go.v2 v2.18.0 // indirect
 	gopkg.in/yaml.v2 v2.4.0 // indirect
-	gvisor.dev/gvisor v0.0.0-20260224225140-573d5e7127a8 // indirect
 	k8s.io/klog/v2 v2.140.0 // indirect
 	k8s.io/kube-openapi v0.0.0-20260501160325-927ab1f70cd6 // indirect
 	k8s.io/streaming v0.36.3 // indirect

@@ -28,25 +28,20 @@ const vipWaitTimeout = 90 * time.Second
 // stops handling them. The local stack then answers for the addresses this
 // returns.
 func (n *Node) hostTUNService(ctx context.Context, svc *service) ([]netip.Addr, error) {
-	srv, err := n.server()
+	// A node that has not finished logging in carries no tags whatever
+	// advertiseTags says, so the check below waits for it to run rather than
+	// report a join in progress as a missing tag.
+	status, err := n.Up(ctx)
 	if err != nil {
 		return nil, err
 	}
 
-	client, err := srv.LocalClient()
-	if err != nil {
-		return nil, fmt.Errorf("tailnet %q: local client: %w", n.name, err)
-	}
-
-	// Only tagged nodes may host a Service; saying so here names the
-	// configuration that is wrong instead of leaving a listener retrying
-	// against a refusal that will not change.
-	status, err := client.Status(ctx)
-	if err != nil {
-		return nil, fmt.Errorf("tailnet %q: reading status: %w", n.name, err)
-	}
+	// Only tagged nodes may host a Service. advertiseTags is required
+	// alongside services when the configuration loads, so a running node
+	// without tags joined with an identity that predates them: a stateDir
+	// from before they were set, or an auth key that could not grant them.
 	if status.Self == nil || status.Self.Tags == nil || status.Self.Tags.Len() == 0 {
-		return nil, fmt.Errorf("tailnet %q: hosting Service %q requires a tagged node; set advertiseTags", n.name, svc.name)
+		return nil, fmt.Errorf("tailnet %q: hosting Service %q requires a tagged node, and this one joined without tags: check that the auth key can grant advertiseTags, or clear a stateDir from before they were set", n.name, svc.name)
 	}
 
 	if err := n.setServiceTUN(ctx, svc.name); err != nil {

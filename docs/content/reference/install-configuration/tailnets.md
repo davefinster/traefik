@@ -206,6 +206,10 @@ entryPoints:
 An advertised route still has to be approved, by an admin or by an ACL
 auto-approver, before the tailnet sends any traffic over it.
 
+A node that advertises routes answers them from Traefik's in-process network
+stack, the one that serves [Services in TUN mode](#serving-tcp-and-udp-on-one-service),
+so routed addresses carry TCP and UDP on both address families alike.
+
 !!! warning "This is not a subnet router"
 
     Traefik answers on an advertised address only where an entryPoint binds

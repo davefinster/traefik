@@ -35,9 +35,10 @@ const localNICID tcpip.NICID = 1
 // plays the part — it holds the Service's virtual IPs, accepts connections
 // on them and answers them, all in userspace.
 //
-// Traffic for the node's advertised routes takes the same path, because a
-// node given a device stops taking subnet traffic into its own netstack, so
-// an entryPoint bound to a routed address listens here as well.
+// Traffic for the node's advertised routes takes the same path: a node that
+// advertises routes is always given a device, and a node given one stops
+// taking subnet traffic into its own netstack, so an entryPoint bound to a
+// routed address listens here as well.
 //
 // It is the only way to serve TCP on a Service VIP from an embedded node.
 // tsnet's netstack intercepts VIP TCP only for ports a serve-config handler

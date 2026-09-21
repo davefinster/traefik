@@ -99,7 +99,13 @@ func NewRegistry(cfg map[string]*static.Tailnet) (*Registry, error) {
 			return nil, fmt.Errorf("tailnet %q: hosting a Tailscale Service requires advertiseTags: only tagged nodes may host one", name)
 		}
 
-		node := &Node{name: name, cfg: tn, routes: routes, services: services}
+		// Routes are answered from the local stack too, whether or not a
+		// Service needs it: one path for every address this node answers for
+		// that is not its own. Left to tsnet's own subnet handling, IPv6 to a
+		// routed address went unanswered on the flyscale Fly edges while IPv4
+		// worked (2026-09-21); the local stack serves both families alike, as
+		// it does for TUN-mode Services.
+		node := &Node{name: name, cfg: tn, routes: routes, services: services, tun: len(routes) > 0}
 		for _, svc := range services {
 			if svc.cfg.Mode == static.TailnetServiceModeTUN {
 				node.tun = true
@@ -292,11 +298,11 @@ type Node struct {
 	// race, and the loser is rejected with an etag mismatch.
 	serveMu sync.Mutex
 
-	// tun is set when a Service on this tailnet is served in TUN mode, which
-	// is what makes the node hand its declined packets to an in-process
-	// stack rather than to a (fake) device that discards them. Those packets
-	// include everything for the node's advertised routes, so on such a node
-	// the local stack answers for routed addresses too.
+	// tun is set when a Service on this tailnet is served in TUN mode, or
+	// the node advertises routes. Either makes the node hand its declined
+	// packets to an in-process stack rather than to a (fake) device that
+	// discards them, and those packets include everything for the node's
+	// advertised routes, which the local stack then answers.
 	tun bool
 
 	mu     sync.Mutex
@@ -485,11 +491,10 @@ func (n *Node) Close() {
 // routedAddr reports whether addr is an address inside one of the node's
 // advertised routes, on a node whose packets for it reach the local stack.
 //
-// That is a node with a device, which it has for a Service in TUN mode. Given
-// one, tsnet stops taking subnet traffic into its own netstack and releases
-// it to the device instead, so a listener tsnet opened on a routed address
-// would never see a packet. Without a device tsnet does take that traffic,
-// and its own listeners are the right ones.
+// That is a node with a device, which every node advertising routes has.
+// Given one, tsnet stops taking subnet traffic into its own netstack and
+// releases it to the device instead, so a listener tsnet opened on a routed
+// address would never see a packet.
 func (n *Node) routedAddr(addr string) (netip.AddrPort, bool) {
 	if !n.tun {
 		return netip.AddrPort{}, false

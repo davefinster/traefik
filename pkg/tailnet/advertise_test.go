@@ -238,7 +238,8 @@ func TestRegistryServiceModes(t *testing.T) {
 			node, err := registry.Node("corp")
 			require.NoError(t, err)
 			assert.Equal(t, test.expect, node.ServiceMode("myapp"))
-			assert.Equal(t, test.expect == static.TailnetServiceModeTUN, node.tun)
+			// A device for a TUN-mode Service, and for routes either way.
+			assert.Equal(t, test.expect == static.TailnetServiceModeTUN || len(test.routes) > 0, node.tun)
 		})
 	}
 }
@@ -416,4 +417,28 @@ func TestRoutedAddressServedByLocalStack(t *testing.T) {
 	require.NoError(t, err)
 	assert.Equal(t, datagram, buf[:n])
 	assert.Equal(t, routed.String(), from.String())
+}
+
+// Routes alone give a node its device, so routed addresses are answered by
+// the local stack whether or not any Service is in TUN mode.
+func TestRoutesAloneUseTheLocalStack(t *testing.T) {
+	registry, err := NewRegistry(map[string]*static.Tailnet{
+		"corp":  {StateDir: t.TempDir(), Routes: []string{"100.64.30.0/24", "fd7a:115c:a1e0:ab12::/64"}},
+		"plain": {StateDir: t.TempDir()},
+	})
+	require.NoError(t, err)
+	t.Cleanup(registry.Close)
+
+	corp, err := registry.Node("corp")
+	require.NoError(t, err)
+	assert.True(t, corp.tun)
+
+	for _, addr := range []string{"100.64.30.5:443", "[fd7a:115c:a1e0:ab12::5]:443"} {
+		_, ok := corp.routedAddr(addr)
+		assert.True(t, ok, addr)
+	}
+
+	plain, err := registry.Node("plain")
+	require.NoError(t, err)
+	assert.False(t, plain.tun)
 }

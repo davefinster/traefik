@@ -158,6 +158,31 @@ device and a second gVisor stack **for the TCP half only**. UDP needs none of
 it. Two Services — one TCP-mode, one TUN-mode — avoid the machinery entirely
 at the cost of two names.
 
+### What was built on the back of it
+
+`mode: tun` on a `tailnets.<name>.services.<key>` entry. Traefik advertises
+the Service in TUN mode and takes delivery of its packets in an in-process
+gVisor stack (`pkg/tailnet/localstack.go`, fed by `pkg/tailnet/tundev.go`),
+so TCP and UDP entryPoints can both name one Service.
+
+Verified end to end against global-infrastructure with Traefik hosting and a
+client node reaching it by MagicDNS name:
+
+```
+  TCP traefik-vip-harness.tail58f5f3.ts.net:8443  PASS   backend said: "tcp-over-vip"
+  UDP traefik-vip-harness.tail58f5f3.ts.net:8053  PASS   backend said: "udp-over-vip"
+```
+
+`-probe` runs exactly that half: it brings up only a client node and dials a
+Service by name, for use while something else hosts it.
+
+    go run . -client-tag tag:infra -probe svc:myapp \
+      -tailnet-domain tail58f5f3.ts.net -probe-tcp 8443 -probe-udp 8053
+
+`-ensure-service` creates the Service with all ports (what a TUN-mode host
+advertises), `-mint-key` writes an ephemeral auth key to a file for the
+hosting process to use, and `-delete-service` removes it again.
+
 ### Known harness defect
 
 The node-to-node control fails in every variant, including those where VIP

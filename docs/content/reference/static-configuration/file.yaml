@@ -43,6 +43,13 @@ entryPoints:
     reusePort: true
     tailnet: foobar
     tailnetService: foobar
+    tailnetListeners:
+      - tailnet: foobar
+        service: foobar
+        address: foobar
+      - tailnet: foobar
+        service: foobar
+        address: foobar
     asDefault: true
     transport:
       lifeCycle:

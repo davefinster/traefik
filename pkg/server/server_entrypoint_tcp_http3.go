@@ -26,13 +26,13 @@ type http3server struct {
 
 	http3conn net.PacketConn
 
-	// On a tailnet entryPoint the packet conns are not opened here: tsnet
-	// needs a concrete address for each, which is only known once the node
-	// is up. Start binds one per tailnet address and serves them all.
-	tailnetNode *tailnet.Node
-	tailnetAddr string
-	done        chan struct{}
-	closeOnce   sync.Once
+	// The tailnet sources' packet conns are not opened here: tsnet needs a
+	// concrete address for each, which is only known once the node is up,
+	// and a Service has none until it is hosted. Start binds each source
+	// independently and serves whatever it binds.
+	tailnetSources []tailnetSource
+	done           chan struct{}
+	closeOnce      sync.Once
 
 	lock   sync.RWMutex
 	getter func(data tcpmuxer.ConnData) (*tls.Config, string, error)
@@ -50,32 +50,45 @@ func newHTTP3Server(ctx context.Context, name string, config *static.EntryPoint,
 		return nil, errors.New("advertised port must be greater than or equal to zero")
 	}
 
-	if config.TailnetService != "" {
-		// A Tailscale Service is forwarded to the entryPoint as TCP, so
-		// there is no packet conn for QUIC to read from.
-		return nil, errors.New("http3 is not supported on a Tailscale Service entryPoint")
+	primary, err := primaryTailnetSource(config, tailnets)
+	if err != nil {
+		return nil, err
+	}
+	if primary != nil && !primary.carriesPackets() {
+		// A tcp-mode Service is forwarded to the entryPoint as TCP, so there
+		// is no packet conn for QUIC to read from.
+		return nil, errors.New("http3 is not supported on a Tailscale Service entryPoint in tcp mode: use mode tun")
 	}
 
-	var node *tailnet.Node
-	if config.Tailnet != "" {
-		// Binding is deferred to Start: tsnet needs a concrete IP per packet
-		// conn, and the node has none until it has joined the tailnet.
-		// Waiting for that here would hold up every other entryPoint.
-		node, err = tailnets.Node(config.Tailnet)
-		if err != nil {
-			return nil, err
+	extra, err := resolveTailnetListeners(config, tailnets)
+	if err != nil {
+		return nil, err
+	}
+
+	var sources []tailnetSource
+	if primary != nil {
+		sources = append(sources, *primary)
+	}
+	for _, source := range extra {
+		if !source.carriesPackets() {
+			// Not refused: the entryPoint may serve HTTP/3 on its other
+			// listeners, and a client reaching it through this Service simply
+			// stays on TCP.
+			log.Ctx(ctx).Info().Msgf("HTTP/3 is not served on %s: in tcp mode it carries TCP only", source.description())
+			continue
 		}
+		sources = append(sources, source)
 	}
 
 	// if we have predefined connections from socket activation
-	if node == nil && socketActivation.isEnabled() {
+	if primary == nil && socketActivation.isEnabled() {
 		conn, err = socketActivation.getConn(name)
 		if err != nil {
 			log.Ctx(ctx).Warn().Err(err).Str("name", name).Msg("Unable to use socket activation for entrypoint")
 		}
 	}
 
-	if node == nil && conn == nil {
+	if primary == nil && conn == nil {
 		listenConfig := newListenConfig(config)
 		conn, err = listenConfig.ListenPacket(ctx, "udp", config.GetAddress())
 		if err != nil {
@@ -84,10 +97,9 @@ func newHTTP3Server(ctx context.Context, name string, config *static.EntryPoint,
 	}
 
 	h3 := &http3server{
-		http3conn:   conn,
-		tailnetNode: node,
-		tailnetAddr: config.GetAddress(),
-		done:        make(chan struct{}),
+		http3conn:      conn,
+		tailnetSources: sources,
+		done:           make(chan struct{}),
 		getter: func(data tcpmuxer.ConnData) (*tls.Config, string, error) {
 			return nil, "", errors.New("no TLS config")
 		},
@@ -159,31 +171,52 @@ func withReadTimeout(ctx context.Context, next http.Handler, timeout time.Durati
 	})
 }
 
-// Start serves HTTP/3. On a host entryPoint that is the single packet conn
-// opened at construction; on a tailnet entryPoint it is one conn per tailnet
-// address, bound here once the node is up and retried until it is.
+// Start serves HTTP/3: on the host packet conn opened at construction, if
+// the entryPoint's own address is on the host, and on each tailnet source's
+// conns, bound here once the tailnet allows and retried until it does. A
+// tailnet that is slow to come up delays only its own conns.
 func (e *http3server) Start(ctx context.Context) error {
-	if e.tailnetNode == nil {
-		return e.Serve(e.http3conn)
+	var (
+		wg     sync.WaitGroup
+		errsMu sync.Mutex
+		errs   []error
+	)
+	serve := func(conn net.PacketConn) {
+		// quic-go tracks its listeners individually, so one Serve per conn is
+		// how a single http3.Server covers them all.
+		if err := e.Serve(conn); err != nil {
+			errsMu.Lock()
+			errs = append(errs, err)
+			errsMu.Unlock()
+		}
 	}
 
-	conns, err := e.tailnetNode.RetryListenPacketAll(ctx, "udp", e.tailnetAddr, e.done)
-	if err != nil {
-		return err
+	if e.http3conn != nil {
+		wg.Go(func() { serve(e.http3conn) })
 	}
 
-	log.Ctx(ctx).Info().
-		Str("tailnet", e.tailnetNode.Name()).
-		Int("listeners", len(conns)).
-		Msg("Serving HTTP/3 on tailnet")
+	for _, source := range e.tailnetSources {
+		wg.Go(func() {
+			conns, err := source.listenPackets(ctx, e.done)
+			if err != nil {
+				errsMu.Lock()
+				errs = append(errs, err)
+				errsMu.Unlock()
+				return
+			}
 
-	// quic-go tracks its listeners individually, so one Serve per conn is
-	// how a single http3.Server covers both tailnet address families.
-	var wg sync.WaitGroup
-	errs := make([]error, len(conns))
-	for i, conn := range conns {
-		wg.Go(func() { errs[i] = e.Serve(conn) })
+			log.Ctx(ctx).Info().
+				Str("tailnet", source.node.Name()).
+				Str("source", source.description()).
+				Int("listeners", len(conns)).
+				Msg("Serving HTTP/3 on tailnet")
+
+			for _, conn := range conns {
+				wg.Go(func() { serve(conn) })
+			}
+		})
 	}
+
 	wg.Wait()
 
 	return errors.Join(errs...)

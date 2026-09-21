@@ -227,3 +227,27 @@ func TestLocalStackTCPAndUDPOnOneAddress(t *testing.T) {
 	require.NoError(t, err)
 	assert.Equal(t, "udp", string(buf[:n]))
 }
+
+// A stack whose node never took it, after a failed join, is released on its
+// own. It must not wait for the device to be closed by anything else, and it
+// takes the device with it.
+func TestLocalStackReleaseDoesNotWaitForTheDevice(t *testing.T) {
+	dev := newMemTUN()
+	local, err := newLocalStack(dev)
+	require.NoError(t, err)
+
+	released := make(chan struct{})
+	go func() {
+		local.release()
+		close(released)
+	}()
+
+	select {
+	case <-released:
+	case <-time.After(5 * time.Second):
+		t.Fatal("release blocked waiting for the device")
+	}
+
+	_, ok := dev.receive(nil)
+	assert.False(t, ok)
+}

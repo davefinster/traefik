@@ -134,12 +134,14 @@ func (t *memTUN) send(pkt []byte) {
 }
 
 // receive returns the next packet from the tailnet node, or false once the
-// device is closed.
-func (t *memTUN) receive() ([]byte, bool) {
+// device is closed or done is.
+func (t *memTUN) receive(done <-chan struct{}) ([]byte, bool) {
 	select {
 	case pkt := <-t.inbound:
 		return pkt, true
 	case <-t.closed:
+		return nil, false
+	case <-done:
 		return nil, false
 	}
 }

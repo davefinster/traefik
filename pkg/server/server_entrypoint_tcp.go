@@ -137,11 +137,19 @@ func NewTCPEntryPoints(entryPointsConfig static.EntryPoints, hostResolverConfig 
 			return nil, fmt.Errorf("error while building entryPoint %s: %w", entryPointName, err)
 		}
 
-		if config.TailnetService != "" {
-			if hostedServices[config.Tailnet] == nil {
-				hostedServices[config.Tailnet] = map[string]struct{}{}
+		markHosted := func(tailnetName, service string) {
+			if hostedServices[tailnetName] == nil {
+				hostedServices[tailnetName] = map[string]struct{}{}
 			}
-			hostedServices[config.Tailnet][config.TailnetService] = struct{}{}
+			hostedServices[tailnetName][service] = struct{}{}
+		}
+		if config.TailnetService != "" {
+			markHosted(config.Tailnet, config.TailnetService)
+		}
+		for _, listener := range config.TailnetListeners {
+			if listener != nil && listener.Service != "" {
+				markHosted(listener.Tailnet, listener.Service)
+			}
 		}
 	}
 
@@ -540,7 +548,7 @@ func (oc *onceCloseListener) Close() error {
 // the listener binds on its first Accept and retries until it can, so a
 // tailnet that is slow or unreachable at boot costs only its own entryPoint.
 func buildTailnetListener(ctx context.Context, config *static.EntryPoint, tailnets *tailnet.Registry) (net.Listener, error) {
-	node, err := tailnets.Node(config.Tailnet)
+	source, err := primaryTailnetSource(config, tailnets)
 	if err != nil {
 		return nil, err
 	}
@@ -552,31 +560,10 @@ func buildTailnetListener(ctx context.Context, config *static.EntryPoint, tailne
 		return nil, errors.New("reusePort is not supported on a tailnet entryPoint")
 	}
 
-	var listener net.Listener
-	if config.TailnetService != "" {
-		port, err := entryPointPort(config)
-		if err != nil {
-			return nil, err
-		}
-
-		if !node.HasService(config.TailnetService) {
-			return nil, fmt.Errorf("unknown Tailscale Service %q on tailnet %q", config.TailnetService, config.Tailnet)
-		}
-
-		if node.ServiceMode(config.TailnetService) == static.TailnetServiceModeTUN {
-			// The Service's packets are delivered to the in-process stack,
-			// so the connections carry the peer's real address and there is
-			// no loopback hop to reconstruct it across.
-			listener = node.LazyListenServiceTUN(ctx, config.TailnetService, port)
-		} else {
-			listener = node.LazyListenService(ctx, config.TailnetService, port)
-		}
-	} else {
-		listener = node.LazyListen(ctx, "tcp", config.GetAddress())
-	}
+	listener := source.listen(ctx)
 
 	if config.ProxyProtocol != nil {
-		if config.TailnetService != "" && node.ServiceMode(config.TailnetService) != static.TailnetServiceModeTUN {
+		if source.service != "" && source.mode != static.TailnetServiceModeTUN {
 			// A Service forwarded by Tailscale reaches the entryPoint over a
 			// loopback socket, so the peer is never the client and a
 			// trusted-IP policy has nothing to judge. The Service's own
@@ -618,7 +605,38 @@ func entryPointPort(config *static.EntryPoint) (uint16, error) {
 	return uint16(port), nil
 }
 
+// buildListener returns the entryPoint's listener: its own address, merged
+// with its tailnetListeners when it has any.
 func buildListener(ctx context.Context, name string, config *static.EntryPoint, tailnets *tailnet.Registry) (net.Listener, error) {
+	// Resolved first, so that a mistake in one is reported before the
+	// entryPoint's own address is bound.
+	extra, err := resolveTailnetListeners(config, tailnets)
+	if err != nil {
+		return nil, err
+	}
+
+	listener, err := buildOwnListener(ctx, name, config, tailnets)
+	if err != nil {
+		return nil, err
+	}
+	if len(extra) == 0 {
+		return listener, nil
+	}
+
+	// The entryPoint's proxyProtocol wraps its own listener only: see
+	// static.TailnetListener for why the tailnet ones never parse a header.
+	listeners := make([]net.Listener, 0, 1+len(extra))
+	listeners = append(listeners, listener)
+	for _, source := range extra {
+		listeners = append(listeners, &onceCloseListener{Listener: source.listen(ctx)})
+	}
+
+	return &onceCloseListener{Listener: newMergedListener(ctx, listeners)}, nil
+}
+
+// buildOwnListener returns the listener on the entryPoint's own address, on
+// the host network or on its tailnet.
+func buildOwnListener(ctx context.Context, name string, config *static.EntryPoint, tailnets *tailnet.Registry) (net.Listener, error) {
 	if config.Tailnet != "" {
 		return buildTailnetListener(ctx, config, tailnets)
 	}

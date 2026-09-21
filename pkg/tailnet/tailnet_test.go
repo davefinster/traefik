@@ -135,13 +135,13 @@ func TestNodeBuildReadsAuthKeyFile(t *testing.T) {
 	require.NoError(t, err)
 
 	// Absent file: the build fails, and nothing is cached.
-	_, err = node.build()
+	_, _, err = node.build()
 	require.ErrorContains(t, err, "reading authKeyFile")
 
 	// The key arrives, and trailing whitespace is trimmed.
 	require.NoError(t, os.WriteFile(keyFile, []byte("tskey-auth-secret\n"), 0o600))
 
-	srv, err := node.build()
+	srv, _, err := node.build()
 	require.NoError(t, err)
 	assert.Equal(t, "tskey-auth-secret", srv.AuthKey)
 }
@@ -165,7 +165,7 @@ func TestNodeBuildCarriesConfiguration(t *testing.T) {
 	node, err := registry.Node("corp")
 	require.NoError(t, err)
 
-	srv, err := node.build()
+	srv, _, err := node.build()
 	require.NoError(t, err)
 
 	assert.Equal(t, "traefik-edge", srv.Hostname)

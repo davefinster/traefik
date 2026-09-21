@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"net"
+	"slices"
 	"sync"
 	"time"
 
@@ -81,16 +82,11 @@ type UDPEntryPoint struct {
 	switcher               *udp.HandlerSwitcher
 	transportConfiguration *static.EntryPointsTransport
 
-	// A tailnet entryPoint binds in Start rather than here: tsnet needs a
-	// concrete address per packet conn, which the node only has once it has
-	// joined, and it holds one for each address family. Host entryPoints
-	// bind a single listener at construction, as before.
-	tailnetNode *tailnet.Node
-	// tailnetService, when set, means the packets come from a Tailscale
-	// Service's addresses rather than the node's own.
-	tailnetService string
-	tailnetPort    uint16
-	address        string
+	// Tailnet sources bind in Start rather than here: tsnet needs a concrete
+	// address per packet conn, which the node only has once it has joined,
+	// and a Service has none until it is hosted. A host address binds a
+	// single listener at construction, as before.
+	tailnetSources []tailnetSource
 	timeout        time.Duration
 
 	mu        sync.Mutex
@@ -109,45 +105,39 @@ func NewUDPEntryPoint(config *static.EntryPoint, name string, tailnets *tailnet.
 	ep := &UDPEntryPoint{
 		switcher:               &udp.HandlerSwitcher{},
 		transportConfiguration: config.Transport,
-		address:                config.GetAddress(),
 		timeout:                timeout,
 		done:                   make(chan struct{}),
 	}
 
-	if config.Tailnet != "" {
+	primary, err := primaryTailnetSource(config, tailnets)
+	if err != nil {
+		return nil, err
+	}
+
+	extra, err := resolveTailnetListeners(config, tailnets)
+	if err != nil {
+		return nil, err
+	}
+
+	if primary != nil {
 		if config.ReusePort {
 			return nil, errors.New("reusePort is not supported on a tailnet entryPoint")
 		}
+		ep.tailnetSources = append(ep.tailnetSources, *primary)
+	}
+	ep.tailnetSources = append(ep.tailnetSources, extra...)
 
-		ep.tailnetNode, err = tailnets.Node(config.Tailnet)
-		if err != nil {
-			return nil, err
+	for _, source := range ep.tailnetSources {
+		// Only a Service in TUN mode carries UDP: Tailscale forwards a
+		// tcp-mode Service as TCP, so a UDP entryPoint would have nothing to
+		// accept from one.
+		if !source.carriesPackets() {
+			return nil, fmt.Errorf("tailscale Service %q must be in %q mode to carry UDP", source.service, static.TailnetServiceModeTUN)
 		}
-
-		if config.TailnetService != "" {
-			if !ep.tailnetNode.HasService(config.TailnetService) {
-				return nil, fmt.Errorf("unknown Tailscale Service %q on tailnet %q", config.TailnetService, config.Tailnet)
-			}
-			// Only a Service in TUN mode carries UDP: Tailscale forwards a
-			// tcp-mode Service as TCP, so a UDP entryPoint would have
-			// nothing to accept from one.
-			if ep.tailnetNode.ServiceMode(config.TailnetService) != static.TailnetServiceModeTUN {
-				return nil, fmt.Errorf("tailscale Service %q must be in %q mode to carry UDP", config.TailnetService, static.TailnetServiceModeTUN)
-			}
-
-			port, err := entryPointPort(config)
-			if err != nil {
-				return nil, err
-			}
-			ep.tailnetService = config.TailnetService
-			ep.tailnetPort = port
-		}
-
-		return ep, nil
 	}
 
-	if config.TailnetService != "" {
-		return nil, errors.New("tailnetService requires the entryPoint to name a tailnet")
+	if primary != nil {
+		return ep, nil
 	}
 
 	// if we have predefined connections from socket activation
@@ -174,21 +164,33 @@ func NewUDPEntryPoint(config *static.EntryPoint, name string, tailnets *tailnet.
 	return ep, nil
 }
 
-// Start commences the listening for ep.
+// Start commences the listening for ep: on its host listener straight away,
+// and on each tailnet source once it has bound, all feeding the same handler
+// switcher. A tailnet that is slow to come up delays only its own listeners.
 func (ep *UDPEntryPoint) Start(ctx context.Context) {
 	log.Ctx(ctx).Debug().Msg("Start UDP Server")
 
-	listeners, err := ep.bind(ctx)
-	if err != nil {
-		return
-	}
+	ep.mu.Lock()
+	hostListeners := slices.Clone(ep.listeners)
+	ep.mu.Unlock()
 
-	// A tailnet entryPoint holds one listener per tailnet address, all
-	// feeding the same handler switcher.
 	var wg sync.WaitGroup
-	for _, listener := range listeners {
+	for _, listener := range hostListeners {
 		wg.Go(func() { ep.accept(listener) })
 	}
+
+	for _, source := range ep.tailnetSources {
+		wg.Go(func() {
+			listeners, err := ep.bind(ctx, source)
+			if err != nil {
+				return
+			}
+			for _, listener := range listeners {
+				wg.Go(func() { ep.accept(listener) })
+			}
+		})
+	}
+
 	wg.Wait()
 }
 
@@ -226,29 +228,11 @@ func (ep *UDPEntryPoint) Switch(handler udp.Handler) {
 	ep.switcher.Switch(handler)
 }
 
-// bind returns the listeners to accept on, opening them on the tailnet first
-// if this entryPoint is bound to one. It retries until the tailnet answers,
-// so a tailnet that is not up at boot does not take the entryPoint with it.
-func (ep *UDPEntryPoint) bind(ctx context.Context) ([]*udp.Listener, error) {
-	ep.mu.Lock()
-	switch {
-	case ep.closed:
-		ep.mu.Unlock()
-		return nil, net.ErrClosed
-	case ep.listeners != nil:
-		listeners := ep.listeners
-		ep.mu.Unlock()
-		return listeners, nil
-	}
-	ep.mu.Unlock()
-
-	var conns []net.PacketConn
-	var err error
-	if ep.tailnetService != "" {
-		conns, err = ep.tailnetNode.RetryListenServicePacketTUN(ctx, ep.tailnetService, ep.tailnetPort, ep.done)
-	} else {
-		conns, err = ep.tailnetNode.RetryListenPacketAll(ctx, "udp", ep.address, ep.done)
-	}
+// bind opens a tailnet source's listeners, retrying until the tailnet
+// answers, so a tailnet that is not up at boot does not take the entryPoint
+// with it.
+func (ep *UDPEntryPoint) bind(ctx context.Context, source tailnetSource) ([]*udp.Listener, error) {
+	conns, err := source.listenPackets(ctx, ep.done)
 	if err != nil {
 		return nil, err
 	}
@@ -265,10 +249,9 @@ func (ep *UDPEntryPoint) bind(ctx context.Context) ([]*udp.Listener, error) {
 	}
 
 	// Every address failed. Returning here rather than settling for an empty
-	// set keeps the entryPoint from looking started while listening on
-	// nothing at all.
+	// set keeps the source from looking bound while listening on nothing.
 	if len(listeners) == 0 {
-		return nil, fmt.Errorf("no tailnet listener could be created for entryPoint address %q", ep.address)
+		return nil, fmt.Errorf("no tailnet listener could be created for %s", source.description())
 	}
 
 	ep.mu.Lock()
@@ -279,10 +262,11 @@ func (ep *UDPEntryPoint) bind(ctx context.Context) ([]*udp.Listener, error) {
 		}
 		return nil, net.ErrClosed
 	}
-	ep.listeners = listeners
+	ep.listeners = append(ep.listeners, listeners...)
 
 	log.Ctx(ctx).Info().
-		Str("tailnet", ep.tailnetNode.Name()).
+		Str("tailnet", source.node.Name()).
+		Str("source", source.description()).
 		Int("listeners", len(listeners)).
 		Msg("Listening for UDP on tailnet")
 

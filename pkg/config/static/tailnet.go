@@ -57,7 +57,7 @@ type Tailnet struct {
 	// The node answers for an advertised address only where an entryPoint
 	// binds it: this gives Traefik additional addresses on the tailnet, and
 	// is not a subnet router. Traffic to an advertised address that no
-	// entryPoint binds is dropped.
+	// entryPoint binds is not answered.
 	Routes []string `description:"CIDR prefixes advertised into the tailnet. Traefik answers only on the addresses its entryPoints bind." json:"routes,omitempty" toml:"routes,omitempty" yaml:"routes,omitempty" export:"true"`
 
 	// Services are the Tailscale Services this node can host, keyed by the
@@ -85,10 +85,10 @@ type TailnetService struct {
 	//
 	// "tun" advertises the Service on every port and protocol and takes
 	// delivery of its packets directly, in an in-process network stack. It
-	// is the only way to serve TCP and UDP on one Service, and connections
-	// carry the peer's real address without the PROXY protocol. It changes
-	// how the whole node handles packets, so a tailnet hosting one cannot
-	// also advertise routes.
+	// is the only way to serve TCP, UDP and HTTP/3 on one Service, and
+	// connections carry the peer's real address without the PROXY protocol.
+	// It changes how the whole node handles packets: the same stack then
+	// answers for the node's routed addresses too.
 	Mode string `description:"How the Service is served: tcp (Tailscale forwards TCP to the entryPoint) or tun (Traefik takes the Service's packets directly, carrying TCP and UDP)." json:"mode,omitempty" toml:"mode,omitempty" yaml:"mode,omitempty" export:"true"`
 
 	// Name is the Tailscale Service name, which must start with "svc:".
@@ -126,4 +126,31 @@ const (
 func (t *TailnetService) SetDefaults() {
 	t.Mode = TailnetServiceModeTCP
 	t.ProxyProtocol = 2
+}
+
+// TailnetListener is one more place an entryPoint accepts on, on a tailnet,
+// beside the entryPoint's own address. Every listener feeds the same
+// entryPoint, so the routers attached to it serve all of them alike: an edge
+// taking public traffic on a host port and tailnet traffic on a Service and a
+// routed address keeps one entryPoint name for its routers to use.
+//
+// The entryPoint's proxyProtocol applies to its own address only. On a
+// tailnet listener the peer is the client itself or, for a Service in tcp
+// mode, Tailscale's forwarder, whose header is the Service's own
+// proxyProtocol option; honoring the entryPoint's here would let a tailnet
+// client claim any address it liked.
+type TailnetListener struct {
+	// Tailnet names the tailnet to accept on, as configured under tailnets.
+	Tailnet string `description:"Tailnet to accept on, by its name in the static configuration." json:"tailnet,omitempty" toml:"tailnet,omitempty" yaml:"tailnet,omitempty" export:"true"`
+
+	// Service accepts the named Tailscale Service's traffic, on the port of
+	// the entryPoint's own address. Mutually exclusive with Address.
+	Service string `description:"Tailscale Service whose traffic to accept, on the entryPoint's port." json:"service,omitempty" toml:"service,omitempty" yaml:"service,omitempty" export:"true"`
+
+	// Address is where on the tailnet to accept: an IP, typically one inside
+	// an advertised route, or an IP and port, or a port alone for the node's
+	// own addresses. The port defaults to the entryPoint's, and an empty
+	// address means the node's own addresses on it. Mutually exclusive with
+	// Service.
+	Address string `description:"Address on the tailnet to accept on: an IP, an IP and port, or a port alone for the node's own addresses. Defaults to the node's own addresses on the entryPoint's port." json:"address,omitempty" toml:"address,omitempty" yaml:"address,omitempty" export:"true"`
 }

@@ -40,6 +40,16 @@
     tailnet = "foobar"
     tailnetService = "foobar"
     asDefault = true
+
+    [[entryPoints.EntryPoint0.tailnetListeners]]
+      tailnet = "foobar"
+      service = "foobar"
+      address = "foobar"
+
+    [[entryPoints.EntryPoint0.tailnetListeners]]
+      tailnet = "foobar"
+      service = "foobar"
+      address = "foobar"
     [entryPoints.EntryPoint0.transport]
       keepAliveMaxTime = "42s"
       keepAliveMaxRequests = 42

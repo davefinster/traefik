@@ -35,6 +35,10 @@ const localNICID tcpip.NICID = 1
 // plays the part — it holds the Service's virtual IPs, accepts connections
 // on them and answers them, all in userspace.
 //
+// Traffic for the node's advertised routes takes the same path, because a
+// node given a device stops taking subnet traffic into its own netstack, so
+// an entryPoint bound to a routed address listens here as well.
+//
 // It is the only way to serve TCP on a Service VIP from an embedded node.
 // tsnet's netstack intercepts VIP TCP only for ports a serve-config handler
 // claims, and TUN mode forbids those handlers, so a Service that advertises
@@ -145,7 +149,9 @@ func (s *localStack) pumpFromDevice() {
 	defer s.wg.Done()
 
 	for {
-		pkt, ok := s.dev.receive()
+		// Watching done as well as the device: the stack is released on its
+		// own when a join fails, and the device may never be closed then.
+		pkt, ok := s.dev.receive(s.done)
 		if !ok {
 			return
 		}
@@ -232,6 +238,16 @@ func (s *localStack) listenUDP(addr netip.AddrPort) (net.PacketConn, error) {
 		return nil, fmt.Errorf("listening for packets on %s: %w", addr, err)
 	}
 	return conn, nil
+}
+
+// release closes the stack and then its device, for a stack whose tailnet
+// node never took it. A nil stack is a node that needed none.
+func (s *localStack) release() {
+	if s == nil {
+		return
+	}
+	s.close()
+	_ = s.dev.Close()
 }
 
 func (s *localStack) close() {

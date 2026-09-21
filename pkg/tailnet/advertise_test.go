@@ -1,12 +1,17 @@
 package tailnet
 
 import (
+	"context"
+	"io"
+	"net"
 	"net/netip"
 	"testing"
+	"time"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	"github.com/traefik/traefik/v3/pkg/config/static"
+	"gvisor.dev/gvisor/pkg/tcpip/adapters/gonet"
 )
 
 func TestRegistryRoutes(t *testing.T) {
@@ -195,12 +200,12 @@ func TestRegistryServiceModes(t *testing.T) {
 		},
 		{
 			// A node given a device stops absorbing subnet traffic into its
-			// own stack, so advertised routes would go unanswered. Refused
-			// rather than half-working.
-			desc:      "tun cannot be combined with routes",
-			mode:      static.TailnetServiceModeTUN,
-			routes:    []string{"100.64.30.0/24"},
-			expectErr: "cannot be combined with routes",
+			// own stack, and the local stack answers for routed addresses
+			// instead, so the two coexist.
+			desc:   "tun coexists with routes",
+			mode:   static.TailnetServiceModeTUN,
+			routes: []string{"100.64.30.0/24"},
+			expect: static.TailnetServiceModeTUN,
 		},
 		{
 			desc:   "tcp mode coexists with routes",
@@ -259,4 +264,156 @@ func TestListenServiceTUNRejectsTCPModeService(t *testing.T) {
 
 	_, err = node.ListenServiceTUN(t.Context(), "typo", 443)
 	require.ErrorContains(t, err, `unknown Service "typo"`)
+}
+
+func TestRoutedAddr(t *testing.T) {
+	testCases := []struct {
+		desc   string
+		tun    bool
+		addr   string
+		expect netip.AddrPort
+	}{
+		{
+			desc:   "IPv4 inside a route",
+			tun:    true,
+			addr:   "100.64.30.5:443",
+			expect: netip.MustParseAddrPort("100.64.30.5:443"),
+		},
+		{
+			desc:   "IPv6 inside a route",
+			tun:    true,
+			addr:   "[fd7a:115c:a1e0:ab12::5]:443",
+			expect: netip.MustParseAddrPort("[fd7a:115c:a1e0:ab12::5]:443"),
+		},
+		{
+			desc:   "IPv4-mapped IPv6 is the IPv4 address",
+			tun:    true,
+			addr:   "[::ffff:100.64.30.5]:443",
+			expect: netip.MustParseAddrPort("100.64.30.5:443"),
+		},
+		{
+			desc: "outside every route",
+			tun:  true,
+			addr: "100.64.31.5:443",
+		},
+		{
+			desc: "the node's own addresses",
+			tun:  true,
+			addr: ":443",
+		},
+		{
+			// Without a device tsnet takes subnet traffic itself, so its own
+			// listener is the one that sees it.
+			desc: "a node without a device",
+			addr: "100.64.30.5:443",
+		},
+	}
+
+	for _, test := range testCases {
+		t.Run(test.desc, func(t *testing.T) {
+			t.Parallel()
+
+			node := &Node{
+				tun: test.tun,
+				routes: []netip.Prefix{
+					netip.MustParsePrefix("100.64.30.0/24"),
+					netip.MustParsePrefix("fd7a:115c:a1e0:ab12::/64"),
+				},
+			}
+
+			got, ok := node.routedAddr(test.addr)
+			assert.Equal(t, test.expect.IsValid(), ok)
+			assert.Equal(t, test.expect, got)
+		})
+	}
+}
+
+// A routed address on a node with a device is served by the local stack,
+// which is where the node releases the packets for it. The second stack
+// plays the tailnet peer.
+func TestRoutedAddressServedByLocalStack(t *testing.T) {
+	registry, err := NewRegistry(map[string]*static.Tailnet{
+		"corp": {
+			StateDir:      t.TempDir(),
+			AdvertiseTags: []string{"tag:proxy"},
+			Routes:        []string{"100.64.30.0/24"},
+			Services:      map[string]*static.TailnetService{"myapp": {Mode: static.TailnetServiceModeTUN}},
+		},
+	})
+	require.NoError(t, err)
+	t.Cleanup(registry.Close)
+
+	node, err := registry.Node("corp")
+	require.NoError(t, err)
+
+	nodeAddr := netip.MustParseAddr("100.64.0.1")
+	peerAddr := netip.MustParseAddr("100.64.0.2")
+	local, peer := twoStacks(t, nodeAddr, peerAddr)
+
+	node.mu.Lock()
+	node.local = local
+	node.mu.Unlock()
+
+	routed := netip.MustParseAddrPort("100.64.30.5:443")
+
+	listener, err := node.listenRoutedTCP(routed)
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = listener.Close() })
+
+	go func() {
+		conn, err := listener.Accept()
+		if err != nil {
+			return
+		}
+		defer conn.Close()
+		_, _ = io.Copy(conn, conn)
+	}()
+
+	packets, err := node.listenRoutedUDP(routed)
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = packets.Close() })
+
+	go func() {
+		buf := make([]byte, 1500)
+		for {
+			n, from, err := packets.ReadFrom(buf)
+			if err != nil {
+				return
+			}
+			_, _ = packets.WriteTo(buf[:n], from)
+		}
+	}()
+
+	ctx, cancel := context.WithTimeout(t.Context(), 15*time.Second)
+	defer cancel()
+
+	target, proto := fullAddr(routed)
+	conn, err := gonet.DialContextTCP(ctx, peer.ipstack, target, proto)
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = conn.Close() })
+	require.NoError(t, conn.SetDeadline(time.Now().Add(15*time.Second)))
+
+	payload := []byte("tcp to a routed address")
+	_, err = conn.Write(payload)
+	require.NoError(t, err)
+
+	got := make([]byte, len(payload))
+	_, err = io.ReadFull(conn, got)
+	require.NoError(t, err)
+	assert.Equal(t, payload, got)
+
+	client, err := peer.listenUDP(netip.AddrPortFrom(peerAddr, 0))
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = client.Close() })
+	require.NoError(t, client.SetDeadline(time.Now().Add(15*time.Second)))
+
+	datagram := []byte("udp to a routed address")
+	_, err = client.WriteTo(datagram, net.UDPAddrFromAddrPort(routed))
+	require.NoError(t, err)
+
+	buf := make([]byte, 1500)
+	n, from, err := client.ReadFrom(buf)
+	require.NoError(t, err)
+	assert.Equal(t, datagram, buf[:n])
+	assert.Equal(t, routed.String(), from.String())
 }

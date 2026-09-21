@@ -1,7 +1,8 @@
 // Package tailnet manages the embedded Tailscale nodes (tailscale.com/tsnet)
 // that Traefik uses for native tailnet connectivity. Each configured tailnet
-// is one in-process userspace Tailscale node: no TUN device, no routing-table
-// or netfilter footprint, so it coexists with a tailscaled on the same host.
+// is one in-process userspace Tailscale node: no operating-system TUN device,
+// no routing-table or netfilter footprint, so it coexists with a tailscaled on
+// the same host.
 //
 // A node serves both directions. EntryPoints referencing a tailnet accept
 // connections on it (Node.Listen, Node.ListenPacket), and serversTransports
@@ -99,19 +100,9 @@ func NewRegistry(cfg map[string]*static.Tailnet) (*Registry, error) {
 		}
 
 		node := &Node{name: name, cfg: tn, routes: routes, services: services}
-		for key, svc := range services {
-			if svc.cfg.Mode != static.TailnetServiceModeTUN {
-				continue
-			}
-			node.tun = true
-			// Taking delivery of a Service's packets means giving the node a
-			// network device, and a node with one stops absorbing subnet
-			// traffic into its own stack. Advertised routes would then go
-			// silently unanswered, so the combination is refused rather than
-			// half-working.
-			if len(routes) > 0 {
-				return nil, fmt.Errorf("tailnet %q: service %q is in %q mode, which cannot be combined with routes on the same tailnet; use a separate tailnet for either",
-					name, key, static.TailnetServiceModeTUN)
+		for _, svc := range services {
+			if svc.cfg.Mode == static.TailnetServiceModeTUN {
+				node.tun = true
 			}
 		}
 
@@ -303,7 +294,9 @@ type Node struct {
 
 	// tun is set when a Service on this tailnet is served in TUN mode, which
 	// is what makes the node hand its declined packets to an in-process
-	// stack rather than to a (fake) device that discards them.
+	// stack rather than to a (fake) device that discards them. Those packets
+	// include everything for the node's advertised routes, so on such a node
+	// the local stack answers for routed addresses too.
 	tun bool
 
 	mu     sync.Mutex
@@ -332,6 +325,9 @@ func (n *Node) Listen(network, addr string) (net.Listener, error) {
 	srv, err := n.server()
 	if err != nil {
 		return nil, err
+	}
+	if routed, ok := n.routedAddr(addr); ok {
+		return n.listenRoutedTCP(routed)
 	}
 	return srv.Listen(network, addr)
 }
@@ -420,6 +416,9 @@ func (n *Node) ListenPacket(network, addr string) (net.PacketConn, error) {
 	if err != nil {
 		return nil, err
 	}
+	if routed, ok := n.routedAddr(addr); ok {
+		return n.listenRoutedUDP(routed)
+	}
 	return srv.ListenPacket(network, addr)
 }
 
@@ -483,6 +482,76 @@ func (n *Node) Close() {
 	}
 }
 
+// routedAddr reports whether addr is an address inside one of the node's
+// advertised routes, on a node whose packets for it reach the local stack.
+//
+// That is a node with a device, which it has for a Service in TUN mode. Given
+// one, tsnet stops taking subnet traffic into its own netstack and releases
+// it to the device instead, so a listener tsnet opened on a routed address
+// would never see a packet. Without a device tsnet does take that traffic,
+// and its own listeners are the right ones.
+func (n *Node) routedAddr(addr string) (netip.AddrPort, bool) {
+	if !n.tun {
+		return netip.AddrPort{}, false
+	}
+
+	addrPort, err := netip.ParseAddrPort(addr)
+	if err != nil {
+		return netip.AddrPort{}, false
+	}
+
+	ip := addrPort.Addr().Unmap()
+	for _, route := range n.routes {
+		if route.Contains(ip) {
+			return netip.AddrPortFrom(ip, addrPort.Port()), true
+		}
+	}
+	return netip.AddrPort{}, false
+}
+
+// listenRoutedTCP accepts TCP for a routed address on the local stack.
+func (n *Node) listenRoutedTCP(addr netip.AddrPort) (net.Listener, error) {
+	local, err := n.holdRouted(addr.Addr())
+	if err != nil {
+		return nil, err
+	}
+
+	ln, err := local.listenTCP(addr)
+	if err != nil {
+		return nil, fmt.Errorf("tailnet %q: %w", n.name, err)
+	}
+	return ln, nil
+}
+
+// listenRoutedUDP accepts UDP for a routed address on the local stack.
+func (n *Node) listenRoutedUDP(addr netip.AddrPort) (net.PacketConn, error) {
+	local, err := n.holdRouted(addr.Addr())
+	if err != nil {
+		return nil, err
+	}
+
+	conn, err := local.listenUDP(addr)
+	if err != nil {
+		return nil, fmt.Errorf("tailnet %q: %w", n.name, err)
+	}
+	return conn, nil
+}
+
+// holdRouted gives the local stack a routed address to answer for.
+func (n *Node) holdRouted(addr netip.Addr) (*localStack, error) {
+	n.mu.Lock()
+	local := n.local
+	n.mu.Unlock()
+	if local == nil {
+		return nil, fmt.Errorf("tailnet %q: no local stack for routed address %s", n.name, addr)
+	}
+
+	if err := local.addAddr(addr); err != nil {
+		return nil, fmt.Errorf("tailnet %q: %w", n.name, err)
+	}
+	return local, nil
+}
+
 // server returns a started tsnet.Server, building and joining as needed.
 func (n *Node) server() (*tsnet.Server, error) {
 	if srv, settled, err := n.current(); settled {
@@ -497,7 +566,7 @@ func (n *Node) server() (*tsnet.Server, error) {
 		return srv, err
 	}
 
-	srv, err := n.build()
+	srv, local, err := n.build()
 	if err != nil {
 		return nil, err
 	}
@@ -505,8 +574,11 @@ func (n *Node) server() (*tsnet.Server, error) {
 	// tsnet.Server.Start cleans up after itself on failure, so a server that
 	// failed here needs no Close; dropping it means the next attempt gets a
 	// fresh sync.Once rather than the cached error, which is the whole
-	// reason a failed node is rebuilt instead of retried in place.
+	// reason a failed node is rebuilt instead of retried in place. The local
+	// stack was built for this server alone, so it goes with it: kept, every
+	// retry against an unreachable tailnet would leave one more behind.
 	if err := srv.Start(); err != nil {
+		local.release()
 		return nil, fmt.Errorf("tailnet %q: joining: %w", n.name, err)
 	}
 
@@ -517,6 +589,7 @@ func (n *Node) server() (*tsnet.Server, error) {
 	// tailnet that looks healthy and routes nothing.
 	if err := n.advertiseRoutes(srv); err != nil {
 		_ = srv.Close()
+		local.release()
 		return nil, err
 	}
 
@@ -526,9 +599,13 @@ func (n *Node) server() (*tsnet.Server, error) {
 		// Closed while this join was in flight. The server did start, so it
 		// owns resources and must be released.
 		_ = srv.Close()
+		local.release()
 		return nil, net.ErrClosed
 	}
 	n.srv = srv
+	if local != nil {
+		n.dev, n.local = local.dev, local
+	}
 	n.mu.Unlock()
 
 	return srv, nil
@@ -553,12 +630,17 @@ func (n *Node) current() (srv *tsnet.Server, settled bool, err error) {
 // build assembles an unstarted tsnet.Server from the configuration, resolving
 // the auth key file now: reading it at build time rather than at startup lets
 // a key delivered late by an external system be picked up on a retry.
-func (n *Node) build() (*tsnet.Server, error) {
+//
+// On a node that needs one it also returns the local stack, with the device
+// it reads from. Neither is published on the node until the server has
+// started, so a Close meanwhile never races a build, and a failed join
+// releases its own.
+func (n *Node) build() (*tsnet.Server, *localStack, error) {
 	authKey := n.cfg.AuthKey
 	if n.cfg.AuthKeyFile != "" {
 		content, err := os.ReadFile(n.cfg.AuthKeyFile)
 		if err != nil {
-			return nil, fmt.Errorf("tailnet %q: reading authKeyFile: %w", n.name, err)
+			return nil, nil, fmt.Errorf("tailnet %q: reading authKeyFile: %w", n.name, err)
 		}
 		authKey = strings.TrimSpace(string(content))
 	}
@@ -584,20 +666,20 @@ func (n *Node) build() (*tsnet.Server, error) {
 	if n.tun {
 		// With a device attached, tsnet keeps handling its own addresses
 		// (through registered gVisor endpoints) and releases everything else
-		// — the Service's virtual IPs among it — to the device.
+		// — the Service's virtual IPs and the advertised routes among it — to
+		// the device.
 		dev := newMemTUN()
 		local, err := newLocalStack(dev)
 		if err != nil {
 			_ = dev.Close()
-			return nil, fmt.Errorf("tailnet %q: %w", n.name, err)
+			return nil, nil, fmt.Errorf("tailnet %q: %w", n.name, err)
 		}
 
 		srv.Tun = dev
-		n.dev = dev
-		n.local = local
+		return srv, local, nil
 	}
 
-	return srv, nil
+	return srv, nil, nil
 }
 
 // advertiseRoutes sets the node's advertised routes to exactly what the

@@ -123,6 +123,48 @@ nodes are ephemeral and their state directories are temporary, so an
 interrupted run leaves nothing behind but the Service, which `-keep` aside is
 deleted on the way out.
 
+## Results (2026-09-21, global-infrastructure)
+
+Each variant run in its own process with fresh nodes; running them in one
+process contaminates later variants, so trust only single-variant runs.
+
+| Service declares | Host configuration | TCP | UDP |
+| --- | --- | --- | --- |
+| `tcp:8443` | non-TUN, serve-config TCP handler | **PASS** | n/a |
+| `tcp:8443, udp:8053` | non-TUN, serve-config TCP handler | FAIL | FAIL |
+| `*` | TUN mode + `ListenPacket` on the VIP | FAIL | **PASS** |
+| `*` | non-TUN, serve-config TCP handler | FAIL | FAIL |
+
+**A single VIP cannot carry both TCP and UDP into a tsnet host.**
+
+- TCP works only through a serve-config TCP handler, and only when the
+  Service's declared ports match what the host advertises. Where they do not,
+  control assigns the host its VIP addresses but installs no route on the
+  client: the client's dial then escapes to the host network and times out
+  against a CGNAT address (`write udp 192.168.64.2:...->100.93.231.125:8053`),
+  which is the visible signature of an invalid host.
+- UDP works only under TUN-mode advertisement, which is the only way a host
+  advertises UDP at all — and it needs no TUN device and no second netstack,
+  just `tsnet.ListenPacket` bound to the VIP.
+- TUN mode and TCP handlers are mutually exclusive, enforced by tailscaled.
+
+In TUN mode the TCP failure reads `context deadline exceeded` rather than
+`i/o timeout`: the route *is* installed and the dial does reach the tailnet,
+and nothing answers. That is the fake TUN device absorbing the packets,
+exactly as the source predicts.
+
+So terminating both protocols on one VIP in Traefik needs an in-process TUN
+device and a second gVisor stack **for the TCP half only**. UDP needs none of
+it. Two Services — one TCP-mode, one TUN-mode — avoid the machinery entirely
+at the cost of two names.
+
+### Known harness defect
+
+The node-to-node control fails in every variant, including those where VIP
+traffic demonstrably works, so it is currently measuring something other than
+what it claims. The findings above do not rest on it: they come from the VIP
+probes, which are consistent across independent runs of the same node pair.
+
 ## Scope
 
 This is a separate Go module on purpose. Go excludes a directory with its own

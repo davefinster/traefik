@@ -249,24 +249,10 @@ func printMatrix(results []result) {
 	}
 	fmt.Println()
 
-	for _, r := range results {
-		if r.variant.name == "tcp-and-udp-no-tun" && r.setupErr == nil {
-			switch {
-			case r.tcpOK && r.udpOK:
-				fmt.Println("VERDICT: one VIP carries both TCP and UDP with plain tsnet.")
-				fmt.Println("         Traefik needs no second netstack: a serve-config TCP handler for the")
-				fmt.Println("         TCP entryPoints, and ListenPacket on the VIP for the UDP ones.")
-			case r.tcpOK && !r.udpOK:
-				fmt.Println("VERDICT: control does not forward UDP to a host advertising TCP ports only.")
-				fmt.Println("         A single VIP carrying both then needs TUN-mode advertisement, and TUN")
-				fmt.Println("         mode forbids TCP handlers, so the TCP half needs an in-process TUN")
-				fmt.Println("         device and a second gVisor stack. Check udp-only-tun above: if its UDP")
-				fmt.Println("         passes, only TCP is missing and only TCP needs that machinery.")
-			default:
-				fmt.Println("VERDICT: inconclusive; see the per-variant errors above.")
-			}
-		}
-	}
+	fmt.Println("Read the matrix against README.md: the question is whether any single")
+	fmt.Println("row passes both columns. As of 2026-09-21 against global-infrastructure,")
+	fmt.Println("none does: TCP needs a serve-config handler, UDP needs TUN-mode")
+	fmt.Println("advertisement, and tailscaled forbids both on one Service.")
 }
 
 func passFail(ok bool) string {

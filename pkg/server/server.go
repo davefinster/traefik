@@ -50,12 +50,26 @@ func NewServer(routinesPool *safe.Pool, entryPoints TCPEntryPoints, entryPointsU
 	return srv
 }
 
+// tailnetWithdrawTimeout bounds the withdrawal from the tailnets that starts a
+// shutdown. It is a round trip to the node's own backend, which forwards the
+// change to the control plane, so it is short; one that has not finished by
+// then is left to the node's close.
+const tailnetWithdrawTimeout = 5 * time.Second
+
 // Start starts the server and Stop/Close it when context is Done.
 func (s *Server) Start(ctx context.Context) {
 	go func() {
 		<-ctx.Done()
 		logger := log.Ctx(ctx)
 		logger.Info().Msg("I have to go...")
+
+		// First, before any entryPoint stops accepting: stop advertising
+		// into the tailnets, so peers move to another node while this one
+		// still answers. See Registry.Withdraw.
+		withdrawCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), tailnetWithdrawTimeout)
+		s.tailnets.Withdraw(withdrawCtx)
+		cancel()
+
 		logger.Info().Msg("Stopping server gracefully")
 		s.Stop()
 	}()

@@ -122,6 +122,9 @@ func (n *Node) setServiceTUN(ctx context.Context, svc tailcfg.ServiceName) error
 // advertiseService adds the Service to the node's advertised set, which is
 // what tells the control plane this node hosts it.
 func (n *Node) advertiseService(ctx context.Context, svc tailcfg.ServiceName) error {
+	if n.isWithdrawn() {
+		return fmt.Errorf("tailnet %q: not advertising Service %q: shutting down", n.name, svc)
+	}
 	srv, err := n.server()
 	if err != nil {
 		return err

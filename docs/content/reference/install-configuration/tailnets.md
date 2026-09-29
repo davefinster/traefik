@@ -558,6 +558,28 @@ INFO  EntryPoint "web" started
 INFO  Listening on tailnet  tailnet=corp address=100.64.0.7:443
 ```
 
+## Shutdown
+
+On `SIGTERM` or `SIGINT`, before any entryPoint stops accepting, every running
+node withdraws what it advertises: its routes and the Services it hosts. It
+stays joined, and its listeners stay open, while the entryPoints drain. Peers
+therefore move to another node advertising the same routes or Service, such as a
+second replica or the process replacing this one, while this one still answers
+whatever reaches it in the meantime.
+
+Give them time to move with the entryPoints'
+`transport.lifeCycle.requestAcceptGraceTimeout`. Nodes are closed once
+everything has drained, and an ephemeral node is logged out then.
+
+```text
+INFO  I have to go...
+INFO  Withdrew routes and Services from the tailnet ahead of shutdown; the node stays joined while the entryPoints drain  tailnet=corp routes=["100.64.30.0/24"]
+INFO  Stopping server gracefully
+```
+
+The withdrawal is limited to five seconds. A node that cannot complete it is
+withdrawn when it closes, as it would have been without this step.
+
 ## State and Identity
 
 `stateDir` holds the node's identity and WireGuard keys. Keep it on persistent

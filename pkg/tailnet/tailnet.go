@@ -265,7 +265,36 @@ func (r *Registry) LogUnhostedServices(hosted map[string]map[string]struct{}) {
 	}
 }
 
-// Close shuts down every node that was started.
+// Withdraw stops every running node publishing anything -- its routes and
+// the Services it hosts -- while leaving it joined and its listeners open.
+// It is the first step of a graceful shutdown.
+//
+// Closing a node withdraws all of that too, but only at the very end: after
+// every entryPoint has drained, which is the whole grace period. Until then
+// peers go on sending new connections to a node whose listeners have closed.
+// Withdrawn first, the control plane moves them to another node publishing
+// the same routes or Service -- a second replica, or the process replacing
+// this one -- while this one still answers whatever arrives before they
+// have. An entryPoint's requestAcceptGraceTimeout is how long it waits for
+// that.
+//
+// It is best effort, and bounded by ctx: a node that cannot be reached is
+// withdrawn by closing it, as before.
+func (r *Registry) Withdraw(ctx context.Context) {
+	if r == nil {
+		return
+	}
+
+	var wg sync.WaitGroup
+	for _, node := range r.nodes {
+		wg.Go(func() { node.withdraw(ctx) })
+	}
+	wg.Wait()
+}
+
+// Close shuts down every node that was started. The nodes close together:
+// each may spend seconds logging an ephemeral node out, and one after
+// another they can outlast the time the server allows itself to stop.
 func (r *Registry) Close() {
 	if r == nil {
 		return
@@ -273,9 +302,11 @@ func (r *Registry) Close() {
 
 	r.stopOnce.Do(func() { close(r.stop) })
 
+	var wg sync.WaitGroup
 	for _, node := range r.nodes {
-		node.Close()
+		wg.Go(node.Close)
 	}
+	wg.Wait()
 }
 
 // Node is one embedded Tailscale node. The underlying tsnet.Server is built
@@ -310,6 +341,17 @@ type Node struct {
 	dev    *memTUN
 	local  *localStack
 	closed bool
+	// withdrawn is set by withdraw: the process is shutting down, and a
+	// join or a Service still being set up must not advertise anything
+	// again behind it.
+	withdrawn bool
+}
+
+// isWithdrawn reports whether the node has been withdrawn.
+func (n *Node) isWithdrawn() bool {
+	n.mu.Lock()
+	defer n.mu.Unlock()
+	return n.withdrawn
 }
 
 // Name returns the configured name of the tailnet, as entryPoints and
@@ -461,6 +503,53 @@ func (n *Node) Addrs(ctx context.Context) ([]netip.Addr, error) {
 		return nil, fmt.Errorf("tailnet %q: node is up with no tailnet address", n.name)
 	}
 	return addrs, nil
+}
+
+// withdraw clears the node's advertised routes and Services, if it is
+// running and advertises any. See Registry.Withdraw.
+func (n *Node) withdraw(ctx context.Context) {
+	n.mu.Lock()
+	srv := n.srv
+	closed := n.closed
+	n.withdrawn = true
+	n.mu.Unlock()
+	if srv == nil || closed {
+		return
+	}
+
+	logger := log.Ctx(ctx).With().Str("tailnet", n.name).Logger()
+
+	client, err := srv.LocalClient()
+	if err != nil {
+		logger.Warn().Err(err).Msg("Could not withdraw from the tailnet ahead of shutdown")
+		return
+	}
+
+	prefs, err := client.GetPrefs(ctx)
+	if err != nil {
+		logger.Warn().Err(err).Msg("Could not withdraw from the tailnet ahead of shutdown")
+		return
+	}
+	if len(prefs.AdvertiseRoutes) == 0 && len(prefs.AdvertiseServices) == 0 {
+		return
+	}
+
+	if _, err := client.EditPrefs(ctx, &ipn.MaskedPrefs{
+		AdvertiseRoutesSet:   true,
+		AdvertiseServicesSet: true,
+	}); err != nil {
+		logger.Warn().Err(err).Msg("Could not withdraw from the tailnet ahead of shutdown")
+		return
+	}
+
+	routes := make([]string, 0, len(prefs.AdvertiseRoutes))
+	for _, p := range prefs.AdvertiseRoutes {
+		routes = append(routes, p.String())
+	}
+	logger.Info().
+		Strs("routes", routes).
+		Strs("services", prefs.AdvertiseServices).
+		Msg("Withdrew routes and Services from the tailnet ahead of shutdown; the node stays joined while the entryPoints drain")
 }
 
 // Close shuts the node down if it was started. A node that never started
@@ -691,7 +780,7 @@ func (n *Node) build() (*tsnet.Server, *localStack, error) {
 // configuration names. It is a no-op when none are configured, so a node
 // that never advertised any is not made to talk to its local API.
 func (n *Node) advertiseRoutes(srv *tsnet.Server) error {
-	if len(n.routes) == 0 {
+	if len(n.routes) == 0 || n.isWithdrawn() {
 		return nil
 	}
 

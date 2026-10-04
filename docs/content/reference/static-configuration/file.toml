@@ -672,6 +672,8 @@
     stateDir = "foobar"
     authKey = "foobar"
     authKeyFile = "foobar"
+    clientID = "foobar"
+    idTokenFile = "foobar"
     controlURL = "foobar"
     ephemeral = true
     advertiseTags = ["foobar", "foobar"]
@@ -703,6 +705,8 @@
     stateDir = "foobar"
     authKey = "foobar"
     authKeyFile = "foobar"
+    clientID = "foobar"
+    idTokenFile = "foobar"
     controlURL = "foobar"
     ephemeral = true
     advertiseTags = ["foobar", "foobar"]

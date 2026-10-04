@@ -735,6 +735,8 @@ tailnets:
     stateDir: foobar
     authKey: foobar
     authKeyFile: foobar
+    clientID: foobar
+    idTokenFile: foobar
     controlURL: foobar
     ephemeral: true
     advertiseTags:
@@ -760,6 +762,8 @@ tailnets:
     stateDir: foobar
     authKey: foobar
     authKeyFile: foobar
+    clientID: foobar
+    idTokenFile: foobar
     controlURL: foobar
     ephemeral: true
     advertiseTags:

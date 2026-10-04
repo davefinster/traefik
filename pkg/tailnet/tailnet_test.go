@@ -51,12 +51,55 @@ func TestNewRegistry(t *testing.T) {
 			expectErr: `tailnet "corp": authKey and authKeyFile are mutually exclusive`,
 		},
 		{
+			desc: "clientID and authKeyFile are mutually exclusive",
+			cfg: map[string]*static.Tailnet{"corp": {
+				StateDir:      "/tmp/corp",
+				AuthKeyFile:   "/run/secrets/corp",
+				ClientID:      "client-id",
+				AdvertiseTags: []string{"tag:proxy"},
+			}},
+			expectErr: `tailnet "corp": clientID is mutually exclusive with authKey and authKeyFile`,
+		},
+		{
+			desc: "clientID and authKey are mutually exclusive",
+			cfg: map[string]*static.Tailnet{"corp": {
+				StateDir:      "/tmp/corp",
+				AuthKey:       "tskey-auth-xxx",
+				ClientID:      "client-id",
+				AdvertiseTags: []string{"tag:proxy"},
+			}},
+			expectErr: `tailnet "corp": clientID is mutually exclusive with authKey and authKeyFile`,
+		},
+		{
+			desc: "idTokenFile requires clientID",
+			cfg: map[string]*static.Tailnet{"corp": {
+				StateDir:    "/tmp/corp",
+				IDTokenFile: "/run/secrets/token",
+			}},
+			expectErr: `tailnet "corp": idTokenFile requires clientID`,
+		},
+		{
+			desc: "clientID requires advertiseTags",
+			cfg: map[string]*static.Tailnet{"corp": {
+				StateDir:    "/tmp/corp",
+				ClientID:    "client-id",
+				IDTokenFile: "/run/secrets/token",
+			}},
+			expectErr: `tailnet "corp": clientID requires advertiseTags: a federated identity only mints tagged auth keys`,
+		},
+		{
 			desc: "valid",
 			cfg: map[string]*static.Tailnet{
 				"corp": {StateDir: "/tmp/corp"},
 				"edge": {StateDir: "/tmp/edge"},
+				"federated": {
+					StateDir:      "/tmp/federated",
+					ClientID:      "client-id",
+					IDTokenFile:   "/run/secrets/token",
+					AdvertiseTags: []string{"tag:proxy"},
+				},
 			},
-			expectNames: []string{"corp", "edge"},
+			expectNames: []string{"corp", "edge", "federated"},
 		},
 	}
 
@@ -144,6 +187,75 @@ func TestNodeBuildReadsAuthKeyFile(t *testing.T) {
 	srv, _, err := node.build()
 	require.NoError(t, err)
 	assert.Equal(t, "tskey-auth-secret", srv.AuthKey)
+}
+
+func TestNodeBuildReadsIDTokenFile(t *testing.T) {
+	dir := t.TempDir()
+	tokenFile := filepath.Join(dir, "token")
+
+	registry, err := NewRegistry(map[string]*static.Tailnet{
+		"corp": {StateDir: dir, ClientID: "client-id", IDTokenFile: tokenFile, AdvertiseTags: []string{"tag:proxy"}},
+	})
+	require.NoError(t, err)
+
+	node, err := registry.Node("corp")
+	require.NoError(t, err)
+
+	_, _, err = node.build()
+	require.ErrorContains(t, err, "reading idTokenFile")
+
+	require.NoError(t, os.WriteFile(tokenFile, []byte("first.jwt.token\n"), 0o600))
+
+	srv, _, err := node.build()
+	require.NoError(t, err)
+	assert.Equal(t, "first.jwt.token", srv.IDToken)
+	assert.Equal(t, "client-id?ephemeral=false", srv.ClientID)
+	assert.Empty(t, srv.AuthKey)
+
+	// A rotated token is the one the next join presents.
+	require.NoError(t, os.WriteFile(tokenFile, []byte("second.jwt.token"), 0o600))
+
+	srv, _, err = node.build()
+	require.NoError(t, err)
+	assert.Equal(t, "second.jwt.token", srv.IDToken)
+}
+
+func TestFederatedClientID(t *testing.T) {
+	testCases := []struct {
+		desc      string
+		clientID  string
+		ephemeral bool
+		expected  string
+	}{
+		{
+			desc:     "no client ID",
+			expected: "",
+		},
+		{
+			desc:     "persistent node",
+			clientID: "client-id",
+			expected: "client-id?ephemeral=false",
+		},
+		{
+			desc:      "ephemeral node",
+			clientID:  "client-id",
+			ephemeral: true,
+			expected:  "client-id?ephemeral=true",
+		},
+		{
+			desc:     "attributes given are kept",
+			clientID: "client-id?ephemeral=true&preauthorized=true",
+			expected: "client-id?ephemeral=true&preauthorized=true",
+		},
+	}
+
+	for _, test := range testCases {
+		t.Run(test.desc, func(t *testing.T) {
+			t.Parallel()
+
+			assert.Equal(t, test.expected, federatedClientID(test.clientID, test.ephemeral))
+		})
+	}
 }
 
 func TestNodeBuildCarriesConfiguration(t *testing.T) {

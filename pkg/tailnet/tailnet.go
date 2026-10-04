@@ -21,6 +21,7 @@ import (
 	"net"
 	"net/netip"
 	"os"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -28,6 +29,10 @@ import (
 	"github.com/pires/go-proxyproto"
 	"github.com/rs/zerolog/log"
 	"github.com/traefik/traefik/v3/pkg/config/static"
+	// Registers workload identity federation, which mints the auth key for a
+	// clientID from an ID token. Without it, tsnet ignores the client ID and
+	// joins with no auth key at all.
+	_ "tailscale.com/feature/identityfederation"
 	// Registers support for OAuth client secrets (tskey-client-...) as auth
 	// keys. Without it, tsnet would send the client secret to the control
 	// plane as though it were an auth key, and the join would be rejected.
@@ -80,6 +85,20 @@ func NewRegistry(cfg map[string]*static.Tailnet) (*Registry, error) {
 		}
 		if tn.AuthKey != "" && tn.AuthKeyFile != "" {
 			return nil, fmt.Errorf("tailnet %q: authKey and authKeyFile are mutually exclusive", name)
+		}
+		// tsnet prefers an auth key and would silently skip the federated
+		// identity, leaving a configuration that says one thing and joins as
+		// another.
+		if tn.ClientID != "" && (tn.AuthKey != "" || tn.AuthKeyFile != "") {
+			return nil, fmt.Errorf("tailnet %q: clientID is mutually exclusive with authKey and authKeyFile", name)
+		}
+		if tn.IDTokenFile != "" && tn.ClientID == "" {
+			return nil, fmt.Errorf("tailnet %q: idTokenFile requires clientID", name)
+		}
+		// A federated identity mints tagged auth keys only. tsnet would
+		// refuse the join on every retry; refusing here names the setting.
+		if tn.ClientID != "" && len(tn.AdvertiseTags) == 0 {
+			return nil, fmt.Errorf("tailnet %q: clientID requires advertiseTags: a federated identity only mints tagged auth keys", name)
 		}
 
 		routes, err := parseRoutes(tn.Routes)
@@ -722,8 +741,9 @@ func (n *Node) current() (srv *tsnet.Server, settled bool, err error) {
 }
 
 // build assembles an unstarted tsnet.Server from the configuration, resolving
-// the auth key file now: reading it at build time rather than at startup lets
-// a key delivered late by an external system be picked up on a retry.
+// the auth key and ID token files now: reading them at build time rather than
+// at startup lets a key delivered late by an external system be picked up on
+// a retry, and a rotated ID token be the current one.
 //
 // On a node that needs one it also returns the local stack, with the device
 // it reads from. Neither is published on the node until the server has
@@ -739,12 +759,23 @@ func (n *Node) build() (*tsnet.Server, *localStack, error) {
 		authKey = strings.TrimSpace(string(content))
 	}
 
+	var idToken string
+	if n.cfg.IDTokenFile != "" {
+		content, err := os.ReadFile(n.cfg.IDTokenFile)
+		if err != nil {
+			return nil, nil, fmt.Errorf("tailnet %q: reading idTokenFile: %w", n.name, err)
+		}
+		idToken = strings.TrimSpace(string(content))
+	}
+
 	logger := log.With().Str("tailnet", n.name).Logger()
 
 	srv := &tsnet.Server{
 		Hostname:      n.cfg.Hostname,
 		Dir:           n.cfg.StateDir,
 		AuthKey:       authKey,
+		ClientID:      federatedClientID(n.cfg.ClientID, n.cfg.Ephemeral),
+		IDToken:       idToken,
 		ControlURL:    n.cfg.ControlURL,
 		Ephemeral:     n.cfg.Ephemeral,
 		AdvertiseTags: n.cfg.AdvertiseTags,
@@ -774,6 +805,18 @@ func (n *Node) build() (*tsnet.Server, *localStack, error) {
 	}
 
 	return srv, nil, nil
+}
+
+// federatedClientID carries the node's ephemerality to the auth key its
+// federated identity mints. Tailscale reads it from optional attributes on the
+// client ID and assumes ephemeral when there are none, so a node configured as
+// persistent would otherwise register as ephemeral and be removed from the
+// tailnet the next time it went offline.
+func federatedClientID(clientID string, ephemeral bool) string {
+	if clientID == "" || strings.Contains(clientID, "?") {
+		return clientID
+	}
+	return clientID + "?ephemeral=" + strconv.FormatBool(ephemeral)
 }
 
 // advertiseRoutes sets the node's advertised routes to exactly what the

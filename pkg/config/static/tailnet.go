@@ -32,6 +32,27 @@ type Tailnet struct {
 	// instead of holding up the whole process.
 	AuthKeyFile string `description:"File containing the Tailscale auth key for the first join." json:"authKeyFile,omitempty" toml:"authKeyFile,omitempty" yaml:"authKeyFile,omitempty"`
 
+	// ClientID joins as a Tailscale federated identity (workload identity
+	// federation) instead of with an auth key: the ID token in IDTokenFile
+	// is exchanged for an auth key that identity mints, so no long-lived
+	// secret is held at all. It requires AdvertiseTags, within the
+	// identity's own tags, is mutually exclusive with AuthKey and
+	// AuthKeyFile, and like them is unused once StateDir holds a node
+	// identity.
+	//
+	// The node's ephemerality follows Ephemeral, as it does with an auth
+	// key, unless the client ID already carries Tailscale's optional
+	// attributes (?ephemeral=...), which are then used as given.
+	ClientID string `description:"Tailscale federated identity client ID, to join with an ID token instead of an auth key. Requires advertiseTags." json:"clientID,omitempty" toml:"clientID,omitempty" yaml:"clientID,omitempty" export:"true"`
+
+	// IDTokenFile reads the ID token presented for ClientID at every join
+	// attempt rather than once: identity providers issue short-lived tokens
+	// and rotate them in place (a Kubernetes projected service account
+	// token, for one), so a token read at startup would be stale by the time
+	// a retry needed it. With it empty, tsnet falls back to the TS_ID_TOKEN
+	// environment variable.
+	IDTokenFile string `description:"File containing the ID token exchanged for clientID's auth key, read at every join attempt." json:"idTokenFile,omitempty" toml:"idTokenFile,omitempty" yaml:"idTokenFile,omitempty"`
+
 	// ControlURL overrides the coordination server, for Headscale and other
 	// self-hosted control planes. Empty means the Tailscale default.
 	ControlURL string `description:"Coordination server URL. Defaults to the Tailscale control plane." json:"controlURL,omitempty" toml:"controlURL,omitempty" yaml:"controlURL,omitempty" export:"true"`

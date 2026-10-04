@@ -84,6 +84,8 @@ entryPoints:
 | <a id="opt-tailnets-name-stateDir" href="#opt-tailnets-name-stateDir" title="#opt-tailnets-name-stateDir">`tailnets.<name>.`<br />`stateDir`</a> | Directory holding the node identity and WireGuard state. <br /> Required: tsnet derives a single default directory from the binary name, which several nodes in one process cannot share. | - | Yes |
 | <a id="opt-tailnets-name-authKey" href="#opt-tailnets-name-authKey" title="#opt-tailnets-name-authKey">`tailnets.<name>.`<br />`authKey`</a> | Auth key for the first join, unused once `stateDir` holds an identity. <br /> Also accepts an OAuth client secret (`tskey-client-...`), which requires `advertiseTags`. <br /> Mutually exclusive with `authKeyFile`; with both empty, tsnet falls back to the `TS_AUTHKEY` environment variable. | - | No |
 | <a id="opt-tailnets-name-authKeyFile" href="#opt-tailnets-name-authKeyFile" title="#opt-tailnets-name-authKeyFile">`tailnets.<name>.`<br />`authKeyFile`</a> | File to read the auth key from. <br /> Read at the first join attempt rather than at startup, so a key delivered by an external system after Traefik starts is picked up by a retry. | - | No |
+| <a id="opt-tailnets-name-clientID" href="#opt-tailnets-name-clientID" title="#opt-tailnets-name-clientID">`tailnets.<name>.`<br />`clientID`</a> | Client ID of a Tailscale federated identity, to join with an ID token instead of an auth key. See [Joining as a Federated Identity](#joining-as-a-federated-identity). <br /> Requires `advertiseTags`, and is mutually exclusive with `authKey` and `authKeyFile`. | - | No |
+| <a id="opt-tailnets-name-idTokenFile" href="#opt-tailnets-name-idTokenFile" title="#opt-tailnets-name-idTokenFile">`tailnets.<name>.`<br />`idTokenFile`</a> | File to read the ID token presented for `clientID` from. <br /> Read at every join attempt, so a token the identity provider rotates in place is always current. With it empty, tsnet falls back to the `TS_ID_TOKEN` environment variable. | - | No |
 | <a id="opt-tailnets-name-controlURL" href="#opt-tailnets-name-controlURL" title="#opt-tailnets-name-controlURL">`tailnets.<name>.`<br />`controlURL`</a> | Coordination server URL, for Headscale and other self-hosted control planes. <br /> Empty means the Tailscale control plane. | - | No |
 | <a id="opt-tailnets-name-ephemeral" href="#opt-tailnets-name-ephemeral" title="#opt-tailnets-name-ephemeral">`tailnets.<name>.`<br />`ephemeral`</a> | Registers the node as ephemeral, so the control plane removes it shortly after it goes offline. <br /> Suited to replicas that come and go; with it set, `stateDir` need not outlive the process. | false | No |
 | <a id="opt-tailnets-name-advertiseTags" href="#opt-tailnets-name-advertiseTags" title="#opt-tailnets-name-advertiseTags">`tailnets.<name>.`<br />`advertiseTags`</a> | ACL tags the node advertises (`tag:...`). <br /> Required when `authKey` is an OAuth client secret: Tailscale refuses such a join without explicit tags. | - | No |
@@ -538,6 +540,59 @@ transport with `tailnet` set always uses the standard proxy implementation,
 even when the [FastProxy](./experimental/fastproxy.md) experimental option is
 enabled, because the fast proxy dials with its own dialer.
 
+## Joining as a Federated Identity
+
+Instead of an auth key, a node can join as a Tailscale
+[federated identity](https://tailscale.com/docs/features/workload-identity-federation):
+Tailscale verifies an ID token from an identity provider it trusts, and the
+identity mints the node's auth key. Nothing long-lived is stored, and a token
+issued to another workload is refused.
+
+`clientID` names the identity and `idTokenFile` the token to present. The file is
+read at every join attempt, because identity providers issue short-lived tokens
+and rotate them in place: a Kubernetes projected service account token, for one.
+The identity only mints tagged auth keys, so `advertiseTags` is required, and must
+be within the identity's own tags.
+
+The node is ephemeral or not as `ephemeral` says, as it is with an auth key.
+Tailscale takes that from optional attributes on the client ID and assumes
+ephemeral when there are none, so Traefik adds `?ephemeral=` from the option; a
+client ID that already carries attributes is used as given.
+
+```yaml tab="File (YAML)"
+## Static configuration
+tailnets:
+  corp:
+    hostname: traefik
+    stateDir: /var/lib/traefik/tsnet/corp
+    clientID: <federated identity client ID>
+    idTokenFile: /var/run/secrets/tailscale/token
+    advertiseTags:
+      - tag:proxy
+```
+
+```toml tab="File (TOML)"
+## Static configuration
+[tailnets.corp]
+  hostname = "traefik"
+  stateDir = "/var/lib/traefik/tsnet/corp"
+  clientID = "<federated identity client ID>"
+  idTokenFile = "/var/run/secrets/tailscale/token"
+  advertiseTags = ["tag:proxy"]
+```
+
+```bash tab="CLI"
+## Static configuration
+--tailnets.corp.hostname=traefik
+--tailnets.corp.stateDir=/var/lib/traefik/tsnet/corp
+--tailnets.corp.clientID=<federated identity client ID>
+--tailnets.corp.idTokenFile=/var/run/secrets/tailscale/token
+--tailnets.corp.advertiseTags=tag:proxy
+```
+
+Like an auth key, the identity is used only for the first join: once `stateDir`
+holds the node's identity, a restart rejoins without it.
+
 ## Startup and Failure Behaviour
 
 Nodes join lazily, on their first use, and Traefik never waits for a tailnet in
@@ -549,8 +604,9 @@ order to start:
 
 A tailnet that cannot reach its control plane therefore degrades only the
 routes that depend on it, and heals without a restart once the tailnet answers.
-An auth key that has not been delivered yet behaves the same way, which is why
-`authKeyFile` is read at the join attempt and not at startup.
+An auth key or ID token that has not been delivered yet behaves the same way,
+which is why `authKeyFile` and `idTokenFile` are read at the join attempt and not
+at startup.
 
 ```text
 WARN  Cannot listen on tailnet yet, retrying  tailnet=corp retryIn=1s

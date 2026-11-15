@@ -12,6 +12,7 @@ import (
 
 	"github.com/quic-go/quic-go"
 	"github.com/quic-go/quic-go/http3"
+	"github.com/quic-go/quic-go/qlog"
 	"github.com/rs/zerolog/log"
 	"github.com/traefik/traefik/v3/pkg/config/static"
 	tcpmuxer "github.com/traefik/traefik/v3/pkg/muxer/tcp"
@@ -113,6 +114,12 @@ func newHTTP3Server(ctx context.Context, name string, config *static.EntryPoint,
 
 	quicConfig := &quic.Config{
 		Allow0RTT: config.HTTP3.Allow0RTT,
+		// A qlog trace of every connection, written to the directory named by
+		// the QLOGDIR environment variable, and nothing when it is unset:
+		// what the sender's congestion window, pacing and flow control did,
+		// for a transfer that is slower than its path. One file per
+		// connection, so it is for a diagnosis, not for leaving on.
+		Tracer: qlog.DefaultConnectionTracer,
 	}
 	if config.HTTP3.InitialPacketSize > 0 {
 		if config.HTTP3.InitialPacketSize < 1200 {

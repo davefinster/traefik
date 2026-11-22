@@ -26,7 +26,7 @@ const (
 	httpProtocol  = "http"
 )
 
-func (p *Provider) loadIngressRouteConfiguration(ctx context.Context, client Client, tlsConfigs map[string]*tls.CertAndStores) *dynamic.HTTPConfiguration {
+func (p *Provider) loadIngressRouteConfiguration(ctx context.Context, client *Client, tlsConfigs map[string]*tls.CertAndStores) *dynamic.HTTPConfiguration {
 	conf := &dynamic.HTTPConfiguration{
 		Routers:           map[string]*dynamic.Router{},
 		Middlewares:       map[string]*dynamic.Middleware{},
@@ -168,6 +168,14 @@ func (p *Provider) loadIngressRouteConfiguration(ctx context.Context, client Cli
 				r.Observability.TraceVerbosity = route.Observability.TraceVerbosity
 			}
 
+			if route.RespondingTimeouts != nil {
+				r.RespondingTimeouts, err = buildRouterRespondingTimeouts(*route.RespondingTimeouts)
+				if err != nil {
+					logger.Error().Err(err).Msg("Invalid responding timeouts")
+					continue
+				}
+			}
+
 			if ingressRoute.Spec.TLS != nil {
 				r.TLS = &dynamic.RouterTLSConfig{
 					CertResolver: ingressRoute.Spec.TLS.CertResolver,
@@ -209,6 +217,35 @@ func buildIngressRouteMetadata(ingressRoute *traefikv1alpha1.IngressRoute) *dyna
 	}
 }
 
+// buildRouterRespondingTimeouts returns the router responding timeouts, or nil when none is set.
+func buildRouterRespondingTimeouts(timeouts traefikv1alpha1.RouterRespondingTimeouts) (*dynamic.RouterRespondingTimeouts, error) {
+	if timeouts.ReadTimeout == nil && timeouts.WriteTimeout == nil {
+		return nil, nil
+	}
+
+	var result dynamic.RouterRespondingTimeouts
+
+	if timeouts.ReadTimeout != nil {
+		var readTimeout ptypes.Duration
+		if err := readTimeout.Set(timeouts.ReadTimeout.String()); err != nil {
+			return nil, fmt.Errorf("parsing readTimeout: %w", err)
+		}
+
+		result.ReadTimeout = &readTimeout
+	}
+
+	if timeouts.WriteTimeout != nil {
+		var writeTimeout ptypes.Duration
+		if err := writeTimeout.Set(timeouts.WriteTimeout.String()); err != nil {
+			return nil, fmt.Errorf("parsing writeTimeout: %w", err)
+		}
+
+		result.WriteTimeout = &writeTimeout
+	}
+
+	return &result, nil
+}
+
 func makeMiddlewareKeys(ctx context.Context, ingRouteNamespace string, middlewares []traefikv1alpha1.MiddlewareRef, crossProviderNamespaces []string, allowCrossNamespace bool, nb nameBuilder) ([]string, error) {
 	var mds []string
 
@@ -228,7 +265,7 @@ func makeMiddlewareKeys(ctx context.Context, ingRouteNamespace string, middlewar
 
 // resolveParentRouterNames resolves parent IngressRoute references to router names.
 // It returns the list of parent router names and an error if one occurred during processing.
-func (p *Provider) resolveParentRouterNames(client Client, ingressRoute *traefikv1alpha1.IngressRoute) ([]string, error) {
+func (p *Provider) resolveParentRouterNames(client *Client, ingressRoute *traefikv1alpha1.IngressRoute) ([]string, error) {
 	// If no parent refs, return empty list (not an error).
 	if len(ingressRoute.Spec.ParentRefs) == 0 {
 		return nil, nil
@@ -279,7 +316,7 @@ func (p *Provider) resolveParentRouterNames(client Client, ingressRoute *traefik
 }
 
 type configBuilder struct {
-	client                       Client
+	client                       *Client
 	allowCrossNamespace          bool
 	allowExternalNameServices    bool
 	allowEmptyServices           bool
@@ -407,6 +444,7 @@ func (c configBuilder) buildMirroring(ctx context.Context, tService *traefikv1al
 			Mirrors:     mirrorServices,
 			MirrorBody:  mirroring.MirrorBody,
 			MaxBodySize: mirroring.MaxBodySize,
+			StreamBody:  mirroring.StreamBody,
 		},
 	})
 
@@ -908,7 +946,7 @@ func namespaceOrParentNamespace(namespace, parentNamespace string) string {
 }
 
 // getTLSHTTP mutates tlsConfigs.
-func getTLSHTTP(ctx context.Context, ingressRoute *traefikv1alpha1.IngressRoute, k8sClient Client, tlsConfigs map[string]*tls.CertAndStores) error {
+func getTLSHTTP(ctx context.Context, ingressRoute *traefikv1alpha1.IngressRoute, k8sClient *Client, tlsConfigs map[string]*tls.CertAndStores) error {
 	if ingressRoute.Spec.TLS == nil {
 		return nil
 	}

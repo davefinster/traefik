@@ -7,8 +7,19 @@ import (
 	"sigs.k8s.io/gateway-api/pkg/features"
 )
 
-var SupportedFeatures = sync.OnceValue(func() []features.FeatureName {
-	featureSet := sets.New[features.Feature]().
+// SupportedFeatures returns the supported features,
+// including the ones requiring the experimentalChannel option when it is enabled.
+func SupportedFeatures(experimentalChannel bool) []features.FeatureName {
+	standard, experimental := supportedFeatures()
+	if experimentalChannel {
+		return experimental
+	}
+
+	return standard
+}
+
+var supportedFeatures = sync.OnceValues(func() (standard, experimental []features.FeatureName) {
+	standardSet := sets.New[features.Feature]().
 		Insert(features.GatewayCoreFeatures.UnsortedList()...).
 		Insert(features.GatewayExtendedFeatures.Intersection(extendedGatewayFeatures()).UnsortedList()...).
 		Insert(features.HTTPRouteCoreFeatures.UnsortedList()...).
@@ -22,12 +33,23 @@ var SupportedFeatures = sync.OnceValue(func() []features.FeatureName {
 		Insert(features.TLSRouteExtendedFeatures.Intersection(extendedTLSRouteFeatures()).UnsortedList()...).
 		Insert(features.TCPRouteFeature)
 
-	featureNames := make([]features.FeatureName, 0, featureSet.Len())
-	for f := range featureSet {
-		featureNames = append(featureNames, f.Name)
-	}
-	return featureNames
+	return featureNames(standardSet), featureNames(standardSet.Union(experimentalChannelFeatures()))
 })
+
+func featureNames(featureSet sets.Set[features.Feature]) []features.FeatureName {
+	names := make([]features.FeatureName, 0, featureSet.Len())
+	for f := range featureSet {
+		names = append(names, f.Name)
+	}
+	return names
+}
+
+// experimentalChannelFeatures returns the supported features requiring the experimentalChannel option.
+func experimentalChannelFeatures() sets.Set[features.Feature] {
+	return sets.New(
+		features.GatewayListenerFiltersFeature,
+	)
+}
 
 // extendedGatewayFeatures returns the supported extended Gateway features.
 func extendedGatewayFeatures() sets.Set[features.Feature] {
@@ -35,6 +57,12 @@ func extendedGatewayFeatures() sets.Set[features.Feature] {
 		features.GatewayPort8080Feature,
 		features.GatewayHTTPListenerIsolationFeature,
 		features.GatewayHTTPSListenerDetectMisdirectedRequestsFeature,
+		features.ListenerSetFeature,
+		features.GatewayBackendClientCertificateFeature,
+		features.GatewayFrontendClientCertificateValidationFeature,
+		features.GatewayFrontendClientCertificateValidationInsecureFallbackFeature,
+		// TODO: GEP-5075 requires this feature to be advertised only when the cluster serves the ClusterTrustBundle API.
+		features.ClusterTrustBundleFeature,
 	)
 }
 
@@ -62,11 +90,19 @@ func extendedHTTPRouteFeatures() sets.Set[features.Feature] {
 		features.HTTPRouteResponseHeaderModificationFeature,
 		features.HTTPRouteBackendProtocolH2CFeature,
 		features.HTTPRouteBackendProtocolWebSocketFeature,
+		features.HTTPRouteRequestMirrorFeature,
+		features.HTTPRouteRequestMultipleMirrorsFeature,
+		features.HTTPRouteRequestPercentageMirrorFeature,
 		features.HTTPRouteDestinationPortMatchingFeature,
 		features.HTTPRouteBackendRequestHeaderModificationFeature,
 		features.HTTPRouteNamedRouteRule,
 		features.HTTPRouteParentRefPortFeature,
 		features.HTTPRouteCORS,
+		features.HTTPRouteRequestTimeoutFeature,
+		features.HTTPRouteBackendTimeoutFeature,
+		features.HTTPRouteBackendURLRewriteFeature,
+		features.HTTPRouteRetryCodesFeature,
+		features.HTTPRouteRetryConnectionErrorFeature,
 	)
 }
 
@@ -74,6 +110,7 @@ func extendedHTTPRouteFeatures() sets.Set[features.Feature] {
 func extendedGRPCRouteFeatures() sets.Set[features.Feature] {
 	return sets.New(
 		features.GRPCRouteNamedRouteRule,
+		features.GRPCRouteRequestHeaderModifier,
 	)
 }
 

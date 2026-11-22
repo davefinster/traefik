@@ -21,9 +21,9 @@ import (
 	gatev1 "sigs.k8s.io/gateway-api/apis/v1"
 )
 
-func (p *Provider) loadTLSRoutes(ctx context.Context, gateways []gatewayWithListeners, conf *dynamic.Configuration, statusReport *statusReport) {
+func (p *Provider) loadTLSRoutes(ctx context.Context, gateways []gatewayWithListeners, conf *dynamic.Configuration, statusReport *StatusReport) {
 	logger := log.Ctx(ctx)
-	routes, err := p.client.ListTLSRoutes()
+	routes, err := p.k8sClient.ListTLSRoutes()
 	if err != nil {
 		logger.Error().Err(err).Msgf("Unable to list TLSRoute")
 		return
@@ -136,7 +136,7 @@ type tlsRouteRouter struct {
 	Conf *dynamic.Configuration
 }
 
-func (p *Provider) loadTLSRoute(gatewayName, gatewayNamespace string, listener gatewayListener, route *gatev1.TLSRoute, hostnames []gatev1.Hostname, statusReport *statusReport) ([]tlsRouteRouter, metav1.Condition) {
+func (p *Provider) loadTLSRoute(gatewayName, gatewayNamespace string, listener gatewayListener, route *gatev1.TLSRoute, hostnames []gatev1.Hostname, statusReport *StatusReport) ([]tlsRouteRouter, metav1.Condition) {
 	var routers []tlsRouteRouter
 
 	condition := metav1.Condition{
@@ -212,7 +212,7 @@ func (p *Provider) loadTLSRoute(gatewayName, gatewayNamespace string, listener g
 }
 
 // loadTLSWRRService is generating a WRR service, even when there is only one target.
-func (p *Provider) loadTLSWRRService(gatewayName, gatewayNamespace string, listener gatewayListener, conf *dynamic.Configuration, routerName string, backendRefs []gatev1.BackendRef, route *gatev1.TLSRoute, statusReport *statusReport) (string, *metav1.Condition) {
+func (p *Provider) loadTLSWRRService(gatewayName, gatewayNamespace string, listener gatewayListener, conf *dynamic.Configuration, routerName string, backendRefs []gatev1.BackendRef, route *gatev1.TLSRoute, statusReport *StatusReport) (string, *metav1.Condition) {
 	name := routerName + "-wrr"
 	if _, ok := conf.TCP.Services[name]; ok {
 		return name, nil
@@ -255,7 +255,7 @@ func (p *Provider) loadTLSWRRService(gatewayName, gatewayNamespace string, liste
 	return name, condition
 }
 
-func (p *Provider) loadTLSService(gatewayName, gatewayNamespace string, listener gatewayListener, conf *dynamic.Configuration, routerName string, route *gatev1.TLSRoute, backendIndex int, backendRef gatev1.BackendRef, statusReport *statusReport) (string, *dynamic.TCPService, *metav1.Condition) {
+func (p *Provider) loadTLSService(gatewayName, gatewayNamespace string, listener gatewayListener, conf *dynamic.Configuration, routerName string, route *gatev1.TLSRoute, backendIndex int, backendRef gatev1.BackendRef, statusReport *StatusReport) (string, *dynamic.TCPService, *metav1.Condition) {
 	kind := ptr.Deref(backendRef.Kind, kindService)
 
 	group := groupCore
@@ -333,7 +333,7 @@ func (p *Provider) loadTLSService(gatewayName, gatewayNamespace string, listener
 	return serviceName, &dynamic.TCPService{LoadBalancer: lb}, nil
 }
 
-func (p *Provider) loadTLSServers(gatewayName, gatewayNamespace, namespace string, route *gatev1.TLSRoute, backendRef gatev1.BackendRef, listener gatewayListener, statusReport *statusReport) (*dynamic.TCPServersLoadBalancer, *dynamic.TCPServersTransport, *metav1.Condition) {
+func (p *Provider) loadTLSServers(gatewayName, gatewayNamespace, namespace string, route *gatev1.TLSRoute, backendRef gatev1.BackendRef, listener gatewayListener, statusReport *StatusReport) (*dynamic.TCPServersLoadBalancer, *dynamic.TCPServersTransport, *metav1.Condition) {
 	backendAddresses, svcPort, err := p.getBackendAddresses(namespace, backendRef)
 	if err != nil {
 		return nil, nil, &metav1.Condition{
@@ -346,7 +346,7 @@ func (p *Provider) loadTLSServers(gatewayName, gatewayNamespace, namespace strin
 		}
 	}
 
-	backendTLSPolicies, err := p.client.ListBackendTLSPoliciesForService(namespace, string(backendRef.Name))
+	backendTLSPolicies, err := p.k8sClient.ListBackendTLSPoliciesForService(namespace, string(backendRef.Name))
 	if err != nil {
 		return nil, nil, &metav1.Condition{
 			Type:               string(gatev1.RouteConditionResolvedRefs),
@@ -386,7 +386,7 @@ func (p *Provider) loadTLSServers(gatewayName, gatewayNamespace, namespace strin
 					Kind:        new(gatev1.Kind(kindGateway)),
 					Namespace:   new(gatev1.Namespace(gatewayNamespace)),
 					Name:        gatev1.ObjectName(gatewayName),
-					SectionName: new(gatev1.SectionName(listener.Name)),
+					SectionName: new(gatev1.SectionName(listener.SectionName)),
 				},
 				ControllerName: controllerName,
 			}
@@ -416,7 +416,7 @@ func (p *Provider) loadTLSServers(gatewayName, gatewayNamespace, namespace strin
 			}
 
 			var resolvedRefCondition metav1.Condition
-			serversTransport, resolvedRefCondition = p.loadTCPServersTransport(namespace, policy)
+			serversTransport, resolvedRefCondition = p.loadTCPServersTransport(namespace, policy, listener.BackendClientCertificates)
 
 			policyAncestorStatus.Conditions = append(policyAncestorStatus.Conditions, resolvedRefCondition)
 			if resolvedRefCondition.Status == metav1.ConditionFalse {
@@ -466,20 +466,23 @@ func (p *Provider) loadTLSServers(gatewayName, gatewayNamespace, namespace strin
 	}
 
 	lb := &dynamic.TCPServersLoadBalancer{}
+	passthrough := listener.TLS != nil && listener.TLS.Mode != nil && *listener.TLS.Mode == gatev1.TLSModePassthrough
 
 	for _, ba := range backendAddresses {
 		lb.Servers = append(lb.Servers, dynamic.TCPServer{
-			// TODO determine whether the servers needs TLS, from the port?
 			Address: net.JoinHostPort(ba.IP, strconv.Itoa(int(ba.Port))),
+			// The ServersTransport TLS configuration is only used to dial TLS servers.
+			TLS: serversTransport != nil && serversTransport.TLS != nil && !passthrough,
 		})
 	}
 	return lb, serversTransport, nil
 }
 
-func (p *Provider) loadTCPServersTransport(namespace string, policy *gatev1.BackendTLSPolicy) (*dynamic.TCPServersTransport, metav1.Condition) {
+func (p *Provider) loadTCPServersTransport(namespace string, policy *gatev1.BackendTLSPolicy, clientCertificates tls.Certificates) (*dynamic.TCPServersTransport, metav1.Condition) {
 	st := &dynamic.TCPServersTransport{
 		TLS: &dynamic.TLSClientConfig{
-			ServerName: string(policy.Spec.Validation.Hostname),
+			ServerName:   string(policy.Spec.Validation.Hostname),
+			Certificates: clientCertificates,
 		},
 	}
 
@@ -525,21 +528,47 @@ func (p *Provider) loadTCPServersTransport(namespace string, policy *gatev1.Back
 	}
 
 	for _, caCertRef := range policy.Spec.Validation.CACertificateRefs {
-		if (caCertRef.Group != "" && caCertRef.Group != groupCore) || (caCertRef.Kind != kindConfigMap && caCertRef.Kind != kindSecret) {
+		isConfigMapOrSecret := (caCertRef.Group == "" || caCertRef.Group == groupCore) && (caCertRef.Kind == kindConfigMap || caCertRef.Kind == kindSecret)
+		isClusterTrustBundle := caCertRef.Group == groupCertificates && caCertRef.Kind == kindClusterTrustBundle
+
+		if !isClusterTrustBundle && !isConfigMapOrSecret {
 			return nil, metav1.Condition{
 				Type:               string(gatev1.BackendTLSPolicyConditionResolvedRefs),
 				Status:             metav1.ConditionFalse,
 				ObservedGeneration: policy.Generation,
 				LastTransitionTime: metav1.Now(),
 				Reason:             string(gatev1.BackendTLSPolicyReasonInvalidKind),
-				Message:            "Only ConfigMaps and Secrets are supported",
+				Message:            "Only ConfigMaps, Secrets, and ClusterTrustBundles are supported",
+			}
+		}
+
+		// GEP-5075 requires the InvalidKind reason when the cluster does not serve the ClusterTrustBundle API.
+		if isClusterTrustBundle && !p.k8sClient.clusterTrustBundleAPIServed {
+			return nil, metav1.Condition{
+				Type:               string(gatev1.BackendTLSPolicyConditionResolvedRefs),
+				Status:             metav1.ConditionFalse,
+				ObservedGeneration: policy.Generation,
+				LastTransitionTime: metav1.Now(),
+				Reason:             string(gatev1.BackendTLSPolicyReasonInvalidKind),
+				Message:            "ClusterTrustBundles are not supported, the cluster does not serve the certificates.k8s.io/v1 API",
+			}
+		}
+
+		if isClusterTrustBundle && !p.k8sClient.clusterTrustBundleAllowed {
+			return nil, metav1.Condition{
+				Type:               string(gatev1.BackendTLSPolicyConditionResolvedRefs),
+				Status:             metav1.ConditionFalse,
+				ObservedGeneration: policy.Generation,
+				LastTransitionTime: metav1.Now(),
+				Reason:             string(gatev1.BackendTLSPolicyReasonInvalidKind),
+				Message:            "ClusterTrustBundles are not supported, Traefik is not allowed to list and watch clustertrustbundles",
 			}
 		}
 
 		var caCRT string
 		switch caCertRef.Kind {
 		case kindConfigMap:
-			configmap, err := p.client.GetConfigMap(namespace, string(caCertRef.Name))
+			configmap, err := p.k8sClient.GetConfigMap(namespace, string(caCertRef.Name))
 			if err != nil {
 				return nil, metav1.Condition{
 					Type:               string(gatev1.BackendTLSPolicyConditionResolvedRefs),
@@ -552,7 +581,7 @@ func (p *Provider) loadTCPServersTransport(namespace string, policy *gatev1.Back
 			}
 			caCRT = configmap.Data["ca.crt"]
 		case kindSecret:
-			secret, err := p.client.GetSecret(namespace, string(caCertRef.Name))
+			secret, err := p.k8sClient.GetSecret(namespace, string(caCertRef.Name))
 			if err != nil {
 				return nil, metav1.Condition{
 					Type:               string(gatev1.BackendTLSPolicyConditionResolvedRefs),
@@ -564,6 +593,31 @@ func (p *Provider) loadTCPServersTransport(namespace string, policy *gatev1.Back
 				}
 			}
 			caCRT = string(secret.Data["ca.crt"])
+		case kindClusterTrustBundle:
+			ctb, err := p.k8sClient.GetClusterTrustBundle(string(caCertRef.Name))
+			if err != nil {
+				return nil, metav1.Condition{
+					Type:               string(gatev1.BackendTLSPolicyConditionResolvedRefs),
+					Status:             metav1.ConditionFalse,
+					ObservedGeneration: policy.Generation,
+					LastTransitionTime: metav1.Now(),
+					Reason:             string(gatev1.BackendTLSPolicyReasonInvalidCACertificateRef),
+					Message:            fmt.Sprintf("Cannot get ClusterTrustBundle %s: %s", string(caCertRef.Name), err),
+				}
+			}
+
+			if ctb.Spec.TrustBundle == "" {
+				return nil, metav1.Condition{
+					Type:               string(gatev1.BackendTLSPolicyConditionResolvedRefs),
+					Status:             metav1.ConditionFalse,
+					ObservedGeneration: policy.Generation,
+					LastTransitionTime: metav1.Now(),
+					Reason:             string(gatev1.BackendTLSPolicyReasonInvalidCACertificateRef),
+					Message:            fmt.Sprintf("ClusterTrustBundle %s has an empty trustBundle", string(caCertRef.Name)),
+				}
+			}
+
+			caCRT = ctb.Spec.TrustBundle
 		}
 
 		if caCRT == "" {

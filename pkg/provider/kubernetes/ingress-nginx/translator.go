@@ -13,6 +13,7 @@ import (
 
 	"github.com/rs/zerolog/log"
 	"github.com/traefik/traefik/v3/pkg/config/dynamic"
+	httpmuxer "github.com/traefik/traefik/v3/pkg/muxer/http"
 	"github.com/traefik/traefik/v3/pkg/tls"
 	"github.com/traefik/traefik/v3/pkg/types"
 	netv1 "k8s.io/api/networking/v1"
@@ -32,7 +33,9 @@ func (p *Provider) translate(ctx context.Context, mc *model) *dynamic.Configurat
 			Routers:  make(map[string]*dynamic.TCPRouter),
 			Services: make(map[string]*dynamic.TCPService),
 		},
-		TLS: &dynamic.TLSConfiguration{},
+		TLS: &dynamic.TLSConfiguration{
+			Options: make(map[string]tls.Options),
+		},
 	}
 
 	lb := &dynamic.ServersLoadBalancer{}
@@ -42,10 +45,8 @@ func (p *Provider) translate(ctx context.Context, mc *model) *dynamic.Configurat
 	for _, k := range slices.Sorted(maps.Keys(mc.Certs)) {
 		cp := mc.Certs[k]
 		conf.TLS.Certificates = append(conf.TLS.Certificates, &tls.CertAndStores{
-			Certificate: tls.Certificate{
-				CertFile: types.FileOrContent(cp.Cert),
-				KeyFile:  types.FileOrContent(cp.Key),
-			},
+			CertFile: types.FileOrContent(cp.Cert),
+			KeyFile:  types.FileOrContent(cp.Key),
 		})
 	}
 
@@ -98,18 +99,6 @@ func (p *Provider) translate(ctx context.Context, mc *model) *dynamic.Configurat
 		// rate-limits, redirects, etc. configured on a "spec.defaultBackend only"
 		// ingress reach its catch-all routers.
 		if loc := mc.DefaultBackendLocation; loc != nil {
-			// Client-auth TLS option (auth-tls-secret) must gate the catch-all TLS
-			// router too, matching ingress-nginx which enforces it server-wide.
-			if loc.TLSOption != nil && loc.TLSOptionName != "" {
-				if conf.TLS.Options == nil {
-					conf.TLS.Options = make(map[string]tls.Options)
-				}
-				if _, exists := conf.TLS.Options[loc.TLSOptionName]; !exists {
-					conf.TLS.Options[loc.TLSOptionName] = *loc.TLSOption
-				}
-				rtTLS.TLS.Options = loc.TLSOptionName
-			}
-
 			if registered {
 				p.applyMiddlewares(mc, loc, defaultBackendName, rt, conf)
 			}
@@ -140,19 +129,15 @@ func (p *Provider) translate(ctx context.Context, mc *model) *dynamic.Configurat
 	}
 
 	for _, srv := range mc.Servers {
+		if srv.AuthTLSError != "" {
+			p.addAuthTLSErrorRouters(ctx, mc, srv, conf)
+			continue
+		}
+
 		for _, loc := range srv.Locations {
 			if loc.ServersTransport != nil && loc.ServersTransportName != "" {
 				if _, exists := conf.HTTP.ServersTransports[loc.ServersTransportName]; !exists {
 					conf.HTTP.ServersTransports[loc.ServersTransportName] = loc.ServersTransport
-				}
-			}
-
-			if loc.TLSOption != nil && loc.TLSOptionName != "" {
-				if conf.TLS.Options == nil {
-					conf.TLS.Options = make(map[string]tls.Options)
-				}
-				if _, exists := conf.TLS.Options[loc.TLSOptionName]; !exists {
-					conf.TLS.Options[loc.TLSOptionName] = *loc.TLSOption
 				}
 			}
 
@@ -205,9 +190,9 @@ func (p *Provider) translate(ctx context.Context, mc *model) *dynamic.Configurat
 
 			var routerKey string
 			if loc.IsIngressDefaultBackend {
-				routerKey = fmt.Sprintf("%s-%s-default-backend", loc.Namespace, loc.IngressName)
+				routerKey = makeKey(loc.Namespace, loc.IngressName) + fmt.Sprintf("-rule-%d-default-backend", loc.RuleIndex)
 			} else {
-				routerKey = fmt.Sprintf("%s-%s-rule-%d-path-%d", loc.Namespace, loc.IngressName, loc.RuleIndex, loc.LocationIndex)
+				routerKey = makeKey(loc.Namespace, loc.IngressName) + fmt.Sprintf("-rule-%d-path-%d", loc.RuleIndex, loc.LocationIndex)
 			}
 
 			rt := &dynamic.Router{
@@ -228,6 +213,7 @@ func (p *Provider) translate(ctx context.Context, mc *model) *dynamic.Configurat
 			if !loc.Error && registered {
 				p.applyMiddlewares(mc, loc, routerKey, rt, conf)
 				applyFromToWwwRedirect(loc, routerKey, rt, obs, conf)
+				applyAppRootRedirect(loc, routerKey, rt, obs, conf)
 			}
 
 			// An ssl-passthrough host is served over TCP on the TLS entryPoints, so it gets no TLS router at all.
@@ -239,9 +225,13 @@ func (p *Provider) translate(ctx context.Context, mc *model) *dynamic.Configurat
 					RuleSyntax:  "default",
 					Service:     routerSvcName,
 					TLS: &dynamic.RouterTLSConfig{
-						Options: loc.TLSOptionName,
+						Options: srv.TLSOptionName,
 					},
 					Observability: obs,
+				}
+
+				if srv.TLSOption != nil {
+					conf.TLS.Options[srv.TLSOptionName] = *srv.TLSOption
 				}
 
 				if loc.Error {
@@ -253,6 +243,7 @@ func (p *Provider) translate(ctx context.Context, mc *model) *dynamic.Configurat
 				if !loc.Error {
 					p.applyMiddlewares(mc, loc, routerKey+"-tls", rtTLS, conf)
 					applyFromToWwwRedirect(loc, routerKey+"-tls", rtTLS, obs, conf)
+					applyAppRootRedirect(loc, routerKey+"-tls", rtTLS, obs, conf)
 				}
 			}
 
@@ -425,6 +416,15 @@ func appendNonCanaryRule(rule string, c *canaryConfig) string {
 	return fmt.Sprintf("(%s) && (%s)", rule, strings.Join(rules, " || "))
 }
 
+func appendLimitAllowlistRule(rule string, allowlist []string) string {
+	quoted := make([]string, 0, len(allowlist))
+	for _, cidr := range allowlist {
+		quoted = append(quoted, fmt.Sprintf("%q", cidr))
+	}
+
+	return fmt.Sprintf("(%s) && ClientIP(%s)", rule, strings.Join(quoted, ", "))
+}
+
 // buildSticky returns a Sticky model if the affinity model is set to "cookie" and nil otherwise.
 // It also appends the given nameSuffix to the cookie name if not empty.
 func buildSticky(cfg IngressConfig, nameSuffix string) *dynamic.Sticky {
@@ -453,6 +453,46 @@ func buildSticky(cfg IngressConfig, nameSuffix string) *dynamic.Sticky {
 }
 
 func (p *Provider) applyMiddlewares(mc *model, loc *location, routerKey string, rt *dynamic.Router, conf *dynamic.Configuration) {
+	p.buildMiddlewareChain(mc, loc, routerKey, rt, conf, true)
+
+	// Every router carrying the location middlewares needs its own limit exemption.
+	p.applyLimitAllowlist(mc, loc, routerKey, rt, conf)
+}
+
+// applyLimitAllowlist adds a router matching the allowlisted client IPs, carrying the
+// same middleware chain as rt without the rate and connection limits. Bypassing the
+// limits with a dedicated router keeps the exemption in the routing layer, and covers
+// limit-connections the same way nginx does by emptying the shared counting key.
+func (p *Provider) applyLimitAllowlist(mc *model, loc *location, routerKey string, rt *dynamic.Router, conf *dynamic.Configuration) {
+	if len(loc.LimitAllowlist) == 0 || !loc.hasLimits() {
+		return
+	}
+
+	allowlistKey := routerKey + "-limit-allowlist"
+	allowlistRouter := &dynamic.Router{
+		EntryPoints:   rt.EntryPoints,
+		Rule:          appendLimitAllowlistRule(rt.Rule, loc.LimitAllowlist),
+		RuleSyntax:    rt.RuleSyntax,
+		Service:       rt.Service,
+		TLS:           rt.TLS,
+		Observability: rt.Observability,
+	}
+
+	// The rule wrapping makes the allowlist rule longer than the rule it exempts, and
+	// the default priority is the rule length: left implicit, the allowlist router
+	// outranks unrelated routers of the same host and steals their traffic.
+	priority := rt.Priority
+	if priority == 0 {
+		priority = httpmuxer.GetRulePriority(rt.Rule)
+	}
+	allowlistRouter.Priority = priority + 1
+
+	conf.HTTP.Routers[allowlistKey] = allowlistRouter
+
+	p.buildMiddlewareChain(mc, loc, allowlistKey, allowlistRouter, conf, false)
+}
+
+func (p *Provider) buildMiddlewareChain(mc *model, loc *location, routerKey string, rt *dynamic.Router, conf *dynamic.Configuration, withLimits bool) {
 	if loc.SSLRedirectOnly && rt.TLS == nil {
 		name := routerKey + "-redirect-scheme"
 		conf.HTTP.Middlewares[name] = &dynamic.Middleware{
@@ -502,6 +542,12 @@ func (p *Provider) applyMiddlewares(mc *model, loc *location, routerKey string, 
 		rt.Middlewares = append(rt.Middlewares, name)
 	}
 
+	if loc.CORS != nil {
+		name := routerKey + "-cors"
+		conf.HTTP.Middlewares[name] = &dynamic.Middleware{Headers: loc.CORS}
+		rt.Middlewares = append(rt.Middlewares, name)
+	}
+
 	if loc.Redirect != nil {
 		name := routerKey + "-redirect"
 		conf.HTTP.Middlewares[name] = &dynamic.Middleware{RedirectRegex: loc.Redirect}
@@ -510,14 +556,31 @@ func (p *Provider) applyMiddlewares(mc *model, loc *location, routerKey string, 
 
 	if loc.BasicAuth != nil {
 		name := routerKey + "-basic-auth"
-		conf.HTTP.Middlewares[name] = &dynamic.Middleware{BasicAuth: loc.BasicAuth}
+		conf.HTTP.Middlewares[name] = &dynamic.Middleware{BasicAuth: loc.BasicAuth, URNRefs: loc.AuthURNRefs}
 		rt.Middlewares = append(rt.Middlewares, name)
 	}
 
 	if loc.DigestAuth != nil {
 		name := routerKey + "-digest-auth"
-		conf.HTTP.Middlewares[name] = &dynamic.Middleware{DigestAuth: loc.DigestAuth}
+		conf.HTTP.Middlewares[name] = &dynamic.Middleware{DigestAuth: loc.DigestAuth, URNRefs: loc.AuthURNRefs}
 		rt.Middlewares = append(rt.Middlewares, name)
+	}
+
+	// Mirrors the proxy_set_header Authorization "" directive ingress-nginx emits alongside basic
+	// and digest auth. It is a service middleware because ingress-nginx still forwards the header
+	// to the auth-url service, which Traefik reaches through a router middleware.
+	if loc.BasicAuth != nil || loc.DigestAuth != nil {
+		if svc, ok := conf.HTTP.Services[rt.Service]; ok {
+			name := rt.Service + "-remove-authorization-header"
+			conf.HTTP.Middlewares[name] = &dynamic.Middleware{
+				Headers: &dynamic.Headers{CustomRequestHeaders: map[string]string{"Authorization": ""}},
+			}
+
+			// The TLS and non-TLS routers of a location share the same service.
+			if !slices.Contains(svc.Middlewares, name) {
+				svc.Middlewares = append(svc.Middlewares, name)
+			}
+		}
 	}
 
 	if loc.Buffering != nil {
@@ -532,39 +595,29 @@ func (p *Provider) applyMiddlewares(mc *model, loc *location, routerKey string, 
 		rt.Middlewares = append(rt.Middlewares, name)
 	}
 
-	if loc.CORS != nil {
-		name := routerKey + "-cors"
-		conf.HTTP.Middlewares[name] = &dynamic.Middleware{Headers: loc.CORS}
-		rt.Middlewares = append(rt.Middlewares, name)
-	}
-
 	if loc.RewriteTarget != nil {
 		name := routerKey + "-rewrite-target"
 		conf.HTTP.Middlewares[name] = &dynamic.Middleware{RewriteTarget: loc.RewriteTarget}
 		rt.Middlewares = append(rt.Middlewares, name)
 	}
 
-	if loc.UpstreamVhost != nil {
-		name := routerKey + "-vhost"
-		conf.HTTP.Middlewares[name] = &dynamic.Middleware{UpstreamVHost: loc.UpstreamVhost}
-		rt.Middlewares = append(rt.Middlewares, name)
-	}
+	if withLimits {
+		if loc.RateLimitRPM != nil {
+			name := routerKey + "-limit-rpm"
+			conf.HTTP.Middlewares[name] = &dynamic.Middleware{RateLimit: loc.RateLimitRPM}
+			rt.Middlewares = append(rt.Middlewares, name)
+		}
+		if loc.RateLimitRPS != nil {
+			name := routerKey + "-limit-rps"
+			conf.HTTP.Middlewares[name] = &dynamic.Middleware{RateLimit: loc.RateLimitRPS}
+			rt.Middlewares = append(rt.Middlewares, name)
+		}
 
-	if loc.RateLimitRPM != nil {
-		name := routerKey + "-limit-rpm"
-		conf.HTTP.Middlewares[name] = &dynamic.Middleware{RateLimit: loc.RateLimitRPM}
-		rt.Middlewares = append(rt.Middlewares, name)
-	}
-	if loc.RateLimitRPS != nil {
-		name := routerKey + "-limit-rps"
-		conf.HTTP.Middlewares[name] = &dynamic.Middleware{RateLimit: loc.RateLimitRPS}
-		rt.Middlewares = append(rt.Middlewares, name)
-	}
-
-	if loc.LimitConnections != nil {
-		name := routerKey + "-limit-connections"
-		conf.HTTP.Middlewares[name] = &dynamic.Middleware{InFlightReq: loc.LimitConnections}
-		rt.Middlewares = append(rt.Middlewares, name)
+		if loc.LimitConnections != nil {
+			name := routerKey + "-limit-connections"
+			conf.HTTP.Middlewares[name] = &dynamic.Middleware{InFlightReq: loc.LimitConnections}
+			rt.Middlewares = append(rt.Middlewares, name)
+		}
 	}
 
 	// The middleware is attached to the plaintext router as well, and not only to the TLS one:
@@ -586,6 +639,13 @@ func (p *Provider) applyMiddlewares(mc *model, loc *location, routerKey string, 
 	if loc.SnippetAuth != nil {
 		name := routerKey + "-snippet"
 		conf.HTTP.Middlewares[name] = &dynamic.Middleware{Snippet: loc.SnippetAuth}
+		rt.Middlewares = append(rt.Middlewares, name)
+	}
+
+	// Apply upstream-vhost after auth so auth-signin uses the original request host.
+	if loc.UpstreamVhost != nil {
+		name := routerKey + "-vhost"
+		conf.HTTP.Middlewares[name] = &dynamic.Middleware{UpstreamVHost: loc.UpstreamVhost}
 		rt.Middlewares = append(rt.Middlewares, name)
 	}
 
@@ -638,20 +698,147 @@ func applyFromToWwwRedirect(loc *location, routerKey string, rt *dynamic.Router,
 	}
 }
 
+// applyAppRootRedirect registers the extra router matching "/" for the app-root
+// middleware. The middleware itself is registered by applyMiddlewares.
+func applyAppRootRedirect(loc *location, routerKey string, rt *dynamic.Router, obs *dynamic.RouterObservabilityConfig, conf *dynamic.Configuration) {
+	if loc.AppRoot == nil || loc.AppRootExtraRouterRule == "" {
+		return
+	}
+
+	// The redirect router does not carry the location middlewares (auth included),
+	// so it must never reach the backend.
+	conf.HTTP.Routers[routerKey+"-app-root-redirect"] = &dynamic.Router{
+		EntryPoints:   rt.EntryPoints,
+		Rule:          loc.AppRootExtraRouterRule,
+		Priority:      rt.Priority,
+		RuleSyntax:    "default",
+		Middlewares:   []string{routerKey + "-app-root"},
+		Service:       unavailableServiceName,
+		TLS:           rt.TLS,
+		Observability: obs,
+	}
+}
+
+// buildAppRootRouterRule builds the rule of the extra "/" router carrying the app-root middleware.
+// A host-less rule lands on the ingress-nginx catch-all server, which redirects "/" too.
+func buildAppRootRouterRule(host string, aliases []string) string {
+	if host == "" {
+		return `Path("/")`
+	}
+	return fmt.Sprintf("%s && Path(%q)", buildHostRule(host, aliases), "/")
+}
+
+// addAuthTLSErrorRouters registers the routers answering 403 to every request for a host whose auth-tls-secret cannot be used.
+// ingress-nginx returns 403 at the server level, before selecting a location, so none of the locations of the host,
+// and none of their middlewares, ever handle a request, over HTTPS as well as over HTTP.
+func (p *Provider) addAuthTLSErrorRouters(ctx context.Context, mc *model, srv *server, conf *dynamic.Configuration) {
+	log.Ctx(ctx).Error().Msgf("Host %q answers 403: %s", srv.Hostname, srv.AuthTLSError)
+
+	if _, exists := conf.HTTP.Services[forbiddenServiceName]; !exists {
+		conf.HTTP.Services[forbiddenServiceName] = &dynamic.Service{
+			Weighted: &dynamic.WeightedRoundRobin{
+				Services: []dynamic.WRRService{
+					{
+						Name:   forbiddenServiceName,
+						Status: new(http.StatusForbidden),
+						Weight: new(1),
+					},
+				},
+			},
+		}
+	}
+
+	var rule string
+	priority := math.MaxInt32
+	if srv.Hostname != "" {
+		// The host is matched before any path, so the routers of other servers with a longer rule must not win.
+		rule = buildHostRule(srv.Hostname, serverAliases(srv))
+	} else {
+		// The default server only receives the requests for the hosts no other server matches,
+		// and the routers it loses to have a lower priority than the routers of these hosts.
+		rule = `PathPrefix("/")`
+		priority = 1
+
+		var hosts []string
+		for _, other := range mc.Servers {
+			if other.Hostname != "" {
+				hosts = append(hosts, other.Hostname)
+				hosts = append(hosts, serverAliases(other)...)
+			}
+		}
+		slices.Sort(hosts)
+		hosts = slices.Compact(hosts)
+
+		if len(hosts) > 0 {
+			rule += " && !" + buildHostRule(hosts[0], hosts[1:])
+		}
+	}
+
+	// The hostname comes last, after the scheme, so that the names of two servers cannot collide:
+	// as a suffix, "-tls" would give the same name to the TLS router of "foo" and to the other router of "foo-tls".
+	routerKey, routerKeyTLS := "auth-tls-error-http", "auth-tls-error-https"
+	if srv.Hostname != "" {
+		routerKey += "-" + srv.Hostname
+		routerKeyTLS += "-" + srv.Hostname
+	}
+	p.addNonTLSRouter(conf, routerKey, &dynamic.Router{
+		EntryPoints: p.NonTLSEntryPoints,
+		Rule:        rule,
+		RuleSyntax:  "default",
+		Priority:    priority,
+		Service:     forbiddenServiceName,
+	})
+	conf.HTTP.Routers[routerKeyTLS] = &dynamic.Router{
+		EntryPoints: p.TLSEntryPoints,
+		Rule:        rule,
+		RuleSyntax:  "default",
+		Priority:    priority,
+		Service:     forbiddenServiceName,
+		TLS: &dynamic.RouterTLSConfig{
+			Options: srv.TLSOptionName,
+		},
+	}
+
+	// ingress-nginx answers 403 without configuring client auth on the server block,
+	// so a host keeps a TLS option of its own, free of the client auth the default one may carry.
+	if srv.Hostname != "" {
+		tlsOption := tls.Options{}
+		tlsOption.SetDefaults()
+		conf.TLS.Options[srv.TLSOptionName] = tlsOption
+	}
+}
+
+// serverAliases returns the sorted server-alias hostnames resolved for the locations of a server.
+func serverAliases(srv *server) []string {
+	var aliases []string
+	for _, loc := range srv.Locations {
+		aliases = append(aliases, loc.Aliases...)
+	}
+	slices.Sort(aliases)
+
+	return slices.Compact(aliases)
+}
+
+// buildHostRule builds the host part of a router rule, covering the hostname and
+// all the server-alias hostnames resolved for the location.
+func buildHostRule(host string, aliases []string) string {
+	hostRules := make([]string, 0, len(aliases)+1)
+	for _, h := range append([]string{host}, aliases...) {
+		hostRules = append(hostRules, fmt.Sprintf("Host(%q)", h))
+	}
+
+	if len(hostRules) > 1 {
+		return "(" + strings.Join(hostRules, " || ") + ")"
+	}
+
+	return hostRules[0]
+}
+
 func buildRule(host string, loc *location) string {
 	var rules []string
 
 	if host != "" {
-		hosts := append([]string{host}, loc.Aliases...)
-		hostRules := make([]string, 0, len(hosts))
-		for _, h := range hosts {
-			hostRules = append(hostRules, fmt.Sprintf("Host(%q)", h))
-		}
-		if len(hostRules) > 1 {
-			rules = append(rules, "("+strings.Join(hostRules, " || ")+")")
-		} else {
-			rules = append(rules, hostRules[0])
-		}
+		rules = append(rules, buildHostRule(host, loc.Aliases))
 	}
 
 	if len(loc.Path) > 0 {

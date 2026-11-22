@@ -38,7 +38,7 @@ or on one backend's own re-interpretation of a character the standard permits:
 
 - The escape works only with encoded-character handling left permissive. That
   default is a deliberate, documented compatibility decision, revisited only at a major version.
-- The vector is a character [RFC 3986](https://www.rfc-editor.org/rfc/rfc3986) permits in a path
+- The vector is a character [RFC 3986](https://www.rfc-editor.org/rfc/rfc3986.html) permits in a path
   segment, such as a literal `;` or a backslash, and the escape exists only because a given backend
   re-interprets it. That re-interpretation varies by backend and is the backend's to define: path
   parameters introduced by `;` are standard behaviour across the Java servlet family, not one
@@ -166,6 +166,17 @@ in question. If the traversal is gated by an opt-in the operator enabled, such a
 works **without** that opt-in, or defeats it, it is in scope. Equally, a report requiring the ability to
 create or edit the Kubernetes objects involved is not a boundary crossing: that actor already controls
 routing in the namespace.
+
+**Gateways served by a single instance.** A single Traefik instance serves every Gateway it watches
+from one shared routing configuration, so a route attached to one Gateway can match requests intended
+for another Gateway on the same instance. Gateways served by the same instance are not isolated from
+each other: a report showing a route crossing Gateways on a single instance describes a documented
+limit, not a vulnerability. For isolation between Gateways, the
+[Traefik Operator](../security/multi-tenant-kubernetes.md#traefik-operator) provisions a dedicated data
+plane for each Gateway, or you can deploy
+[one Traefik instance per Gateway](../security/multi-tenant-kubernetes.md#one-traefik-instance-per-gateway)
+scoped with [`providers.kubernetesGateway.gateways`](../reference/install-configuration/providers/kubernetes/kubernetes-gateway.md#opt-providers-kubernetesGateway-gateways), as described in
+[Multi-Tenancy in Kubernetes](../security/multi-tenant-kubernetes.md#gateway-api).
 
 **Decided in this class.**
 [GHSA-62fc-8686-hfmq](https://github.com/traefik/traefik/security/advisories/GHSA-62fc-8686-hfmq) (CVE-2026-71325, `allowCrossNamespace=false` bypassed

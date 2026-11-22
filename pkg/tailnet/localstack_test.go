@@ -10,6 +10,7 @@ import (
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+	"github.com/tailscale/wireguard-go/tun"
 	"gvisor.dev/gvisor/pkg/tcpip"
 	"gvisor.dev/gvisor/pkg/tcpip/adapters/gonet"
 	"gvisor.dev/gvisor/pkg/tcpip/network/ipv4"
@@ -26,17 +27,18 @@ func crossWire(t *testing.T, a, b *memTUN) {
 	// queues, because that is what the tailnet node does: Read takes what
 	// the local stack produced, Write hands over what arrives for it.
 	pump := func(from, to *memTUN) {
-		bufs := [][]byte{make([]byte, tunMTU+128)}
-		sizes := make([]int, 1)
+		slab := make([]byte, tunMTU+2*tun.ReadPacketSpacing)
+		packets := make([]tun.ReadPacket, 1)
 		for {
-			n, err := from.Read(bufs, sizes, 0)
+			n, err := from.Read(slab, packets)
 			if err != nil {
 				return
 			}
-			if n == 0 || sizes[0] == 0 {
+			if n == 0 || packets[0].Size == 0 {
 				continue
 			}
-			if _, err := to.Write([][]byte{bufs[0][:sizes[0]]}, 0); err != nil {
+			pkt := slab[packets[0].Offset : packets[0].Offset+packets[0].Size]
+			if _, err := to.Write([][]byte{pkt}, 0); err != nil {
 				return
 			}
 		}

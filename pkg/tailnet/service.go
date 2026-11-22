@@ -12,6 +12,7 @@ import (
 	"github.com/traefik/traefik/v3/pkg/config/static"
 	"tailscale.com/ipn"
 	"tailscale.com/tailcfg"
+	"tailscale.com/tailcfg/nodecap"
 )
 
 // vipWaitTimeout bounds how long a listener waits for the control plane to
@@ -172,7 +173,7 @@ func (n *Node) awaitServiceAddrs(ctx context.Context, svc tailcfg.ServiceName) (
 	for {
 		status, err := client.Status(ctx)
 		if err == nil && status.Self != nil {
-			maps, err := tailcfg.UnmarshalNodeCapJSON[tailcfg.ServiceIPMappings](status.Self.CapMap, tailcfg.NodeAttrServiceHost)
+			maps, err := tailcfg.UnmarshalNodeCapJSON[tailcfg.ServiceIPMappings](status.Self.CapMap, nodecap.ServiceHost)
 			if err == nil {
 				for _, m := range maps {
 					if addrs, ok := m[svc]; ok && len(addrs) > 0 {

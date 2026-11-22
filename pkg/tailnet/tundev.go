@@ -60,8 +60,11 @@ func (t *memTUN) File() *os.File { return nil }
 
 // Read hands the tailnet node packets the local stack has produced. It
 // blocks until there is one, which is what wireguard-go's reader expects.
-func (t *memTUN) Read(bufs [][]byte, sizes []int, offset int) (int, error) {
-	if len(bufs) == 0 {
+// The packet is placed past the spacing every tun.Reader reserves ahead of
+// the first packet and after the last, where the caller writes its own
+// headers in place.
+func (t *memTUN) Read(slab []byte, packets []tun.ReadPacket) (int, error) {
+	if len(packets) == 0 || len(slab) < 2*tun.ReadPacketSpacing {
 		return 0, nil
 	}
 
@@ -69,8 +72,8 @@ func (t *memTUN) Read(bufs [][]byte, sizes []int, offset int) (int, error) {
 	case <-t.closed:
 		return 0, os.ErrClosed
 	case pkt := <-t.outbound:
-		n := copy(bufs[0][offset:], pkt)
-		sizes[0] = n
+		n := copy(slab[tun.ReadPacketSpacing:len(slab)-tun.ReadPacketSpacing], pkt)
+		packets[0] = tun.ReadPacket{Offset: tun.ReadPacketSpacing, Size: n}
 		return 1, nil
 	}
 }

@@ -10,6 +10,7 @@ import (
 	"tailscale.com/client/local"
 	"tailscale.com/ipn"
 	"tailscale.com/tailcfg"
+	"tailscale.com/tailcfg/nodecap"
 	"tailscale.com/tsnet"
 
 	_ "tailscale.com/feature/oauthkey"
@@ -79,9 +80,9 @@ func (n *node) serviceVIPs(ctx context.Context, svc tailcfg.ServiceName) ([]neti
 		return nil, fmt.Errorf("status carried no self node")
 	}
 
-	maps, err := tailcfg.UnmarshalNodeCapJSON[tailcfg.ServiceIPMappings](st.Self.CapMap, tailcfg.NodeAttrServiceHost)
+	maps, err := tailcfg.UnmarshalNodeCapJSON[tailcfg.ServiceIPMappings](st.Self.CapMap, nodecap.ServiceHost)
 	if err != nil {
-		return nil, fmt.Errorf("decoding %s capability: %w", tailcfg.NodeAttrServiceHost, err)
+		return nil, fmt.Errorf("decoding %s capability: %w", nodecap.ServiceHost, err)
 	}
 
 	for _, m := range maps {

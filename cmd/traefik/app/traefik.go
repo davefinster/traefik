@@ -1,4 +1,4 @@
-package main
+package app
 
 import (
 	"context"
@@ -51,7 +51,9 @@ import (
 	"github.com/traefik/traefik/v3/pkg/version"
 )
 
-func main() {
+// Main runs the traefik command, and exits the process when it is done.
+// It is the whole of the main function of the traefik binary.
+func Main(options Options) {
 	// traefik config inits
 	tConfig := cmd.NewTraefikConfiguration()
 
@@ -64,7 +66,7 @@ Complete documentation is available at https://traefik.io`,
 		Configuration: tConfig,
 		Resources:     loaders,
 		Run: func(_ []string) error {
-			return runCmd(&tConfig.Configuration)
+			return runCmd(&tConfig.Configuration, options)
 		},
 	}
 
@@ -89,7 +91,7 @@ Complete documentation is available at https://traefik.io`,
 	logrus.Exit(0)
 }
 
-func runCmd(staticConfiguration *static.Configuration) error {
+func runCmd(staticConfiguration *static.Configuration, options Options) error {
 	ctx, cancel := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer cancel()
 
@@ -130,7 +132,7 @@ func runCmd(staticConfiguration *static.Configuration) error {
 
 	stats(staticConfiguration)
 
-	svr, err := setupServer(staticConfiguration)
+	svr, err := setupServer(staticConfiguration, options)
 	if err != nil {
 		return err
 	}
@@ -178,7 +180,7 @@ func runCmd(staticConfiguration *static.Configuration) error {
 	return nil
 }
 
-func setupServer(staticConfiguration *static.Configuration) (*server.Server, error) {
+func setupServer(staticConfiguration *static.Configuration, options Options) (*server.Server, error) {
 	providerAggregator := aggregator.NewProviderAggregator(*staticConfiguration.Providers)
 
 	ctx := context.Background()
@@ -228,7 +230,7 @@ func setupServer(staticConfiguration *static.Configuration) (*server.Server, err
 
 	// Built before the entryPoints, which take listeners from it,
 	// and before the transport managers, which dial through it.
-	networks, err := setupNetworks(staticConfiguration)
+	networks, err := setupNetworks(staticConfiguration, options)
 	if err != nil {
 		return nil, fmt.Errorf("setting up networks: %w", err)
 	}

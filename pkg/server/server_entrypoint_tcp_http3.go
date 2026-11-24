@@ -16,10 +16,10 @@ import (
 	"github.com/rs/zerolog/log"
 	"github.com/traefik/traefik/v3/pkg/config/static"
 	tcpmuxer "github.com/traefik/traefik/v3/pkg/muxer/tcp"
+	"github.com/traefik/traefik/v3/pkg/network"
 	"github.com/traefik/traefik/v3/pkg/proxy/fast"
 	tcprouter "github.com/traefik/traefik/v3/pkg/server/router/tcp"
 	"github.com/traefik/traefik/v3/pkg/server/service/kerberos"
-	"github.com/traefik/traefik/v3/pkg/tailnet"
 	"github.com/traefik/traefik/v3/pkg/tcp"
 )
 
@@ -28,19 +28,18 @@ type http3server struct {
 
 	http3conn net.PacketConn
 
-	// The tailnet sources' packet conns are not opened here: tsnet needs a
-	// concrete address for each, which is only known once the node is up,
-	// and a Service has none until it is hosted. Start binds each source
-	// independently and serves whatever it binds.
-	tailnetSources []tailnetSource
-	done           chan struct{}
-	closeOnce      sync.Once
+	// The sources' packet conns are not opened at construction:
+	// a source waits for its network before it binds them, which a constructor must not.
+	// Start binds each source on its own, and serves whatever it binds.
+	sources   []network.Source
+	done      chan struct{}
+	closeOnce sync.Once
 
 	lock   sync.RWMutex
 	getter func(data tcpmuxer.ConnData) (*tls.Config, string, error)
 }
 
-func newHTTP3Server(ctx context.Context, name string, config *static.EntryPoint, httpsServer *httpServer, tailnets *tailnet.Registry) (*http3server, error) {
+func newHTTP3Server(ctx context.Context, name string, config *static.EntryPoint, httpsServer *httpServer, sources network.Sources) (*http3server, error) {
 	var conn net.PacketConn
 	var err error
 
@@ -52,45 +51,32 @@ func newHTTP3Server(ctx context.Context, name string, config *static.EntryPoint,
 		return nil, errors.New("advertised port must be greater than or equal to zero")
 	}
 
-	primary, err := primaryTailnetSource(config, tailnets)
-	if err != nil {
-		return nil, err
+	var packetSources []network.Source
+	if sources.Primary != nil {
+		if !sources.Primary.CarriesPackets() {
+			return nil, fmt.Errorf("http3 cannot be served on %s: it carries no packets", sources.Primary)
+		}
+		packetSources = append(packetSources, sources.Primary)
 	}
-	if primary != nil && !primary.carriesPackets() {
-		// A tcp-mode Service is forwarded to the entryPoint as TCP, so there
-		// is no packet conn for QUIC to read from.
-		return nil, errors.New("http3 is not supported on a Tailscale Service entryPoint in tcp mode: use mode tun")
-	}
-
-	extra, err := resolveTailnetListeners(config, tailnets)
-	if err != nil {
-		return nil, err
-	}
-
-	var sources []tailnetSource
-	if primary != nil {
-		sources = append(sources, *primary)
-	}
-	for _, source := range extra {
-		if !source.carriesPackets() {
-			// Not refused: the entryPoint may serve HTTP/3 on its other
-			// listeners, and a client reaching it through this Service simply
-			// stays on TCP.
-			log.Ctx(ctx).Info().Msgf("HTTP/3 is not served on %s: in tcp mode it carries TCP only", source.description())
+	for _, source := range sources.Additional {
+		if !source.CarriesPackets() {
+			// Not refused: the entryPoint may serve HTTP/3 on its other listeners,
+			// and a client reaching it through this source simply stays on TCP.
+			log.Ctx(ctx).Info().Msgf("HTTP/3 is not served on %s: it carries no packets", source)
 			continue
 		}
-		sources = append(sources, source)
+		packetSources = append(packetSources, source)
 	}
 
 	// if we have predefined connections from socket activation
-	if primary == nil && socketActivation.isEnabled() {
+	if sources.Primary == nil && socketActivation.isEnabled() {
 		conn, err = socketActivation.getConn(name)
 		if err != nil {
 			log.Ctx(ctx).Warn().Err(err).Str("name", name).Msg("Unable to use socket activation for entrypoint")
 		}
 	}
 
-	if primary == nil && conn == nil {
+	if sources.Primary == nil && conn == nil {
 		listenConfig := newListenConfig(config)
 		conn, err = listenConfig.ListenPacket(ctx, "udp", config.GetAddress())
 		if err != nil {
@@ -99,9 +85,9 @@ func newHTTP3Server(ctx context.Context, name string, config *static.EntryPoint,
 	}
 
 	h3 := &http3server{
-		http3conn:      conn,
-		tailnetSources: sources,
-		done:           make(chan struct{}),
+		http3conn: conn,
+		sources:   packetSources,
+		done:      make(chan struct{}),
 		getter: func(data tcpmuxer.ConnData) (*tls.Config, string, error) {
 			return nil, "", errors.New("no TLS config")
 		},
@@ -188,23 +174,28 @@ func withReadTimeout(ctx context.Context, next http.Handler, timeout time.Durati
 	})
 }
 
-// Start serves HTTP/3: on the host packet conn opened at construction, if
-// the entryPoint's own address is on the host, and on each tailnet source's
-// conns, bound here once the tailnet allows and retried until it does. A
-// tailnet that is slow to come up delays only its own conns.
+// Start serves HTTP/3: on the host packet conn opened at construction, when the entryPoint has one,
+// and on the packet conns of each source, bound here once its network allows.
+// A network that is slow to come up delays only its own conns.
 func (e *http3server) Start(ctx context.Context) error {
 	var (
 		wg     sync.WaitGroup
 		errsMu sync.Mutex
 		errs   []error
 	)
+
+	fail := func(err error) {
+		errsMu.Lock()
+		defer errsMu.Unlock()
+
+		errs = append(errs, err)
+	}
+
 	serve := func(conn net.PacketConn) {
-		// quic-go tracks its listeners individually, so one Serve per conn is
-		// how a single http3.Server covers them all.
+		// quic-go tracks its listeners individually,
+		// so one Serve per conn is how a single http3.Server covers them all.
 		if err := e.Serve(conn); err != nil {
-			errsMu.Lock()
-			errs = append(errs, err)
-			errsMu.Unlock()
+			fail(err)
 		}
 	}
 
@@ -212,21 +203,15 @@ func (e *http3server) Start(ctx context.Context) error {
 		wg.Go(func() { serve(e.http3conn) })
 	}
 
-	for _, source := range e.tailnetSources {
+	for _, source := range e.sources {
 		wg.Go(func() {
-			conns, err := source.listenPackets(ctx, e.done)
+			conns, err := source.ListenPacket(untilClosed(ctx, e.done))
 			if err != nil {
-				errsMu.Lock()
-				errs = append(errs, err)
-				errsMu.Unlock()
+				fail(err)
 				return
 			}
 
-			log.Ctx(ctx).Info().
-				Str("tailnet", source.node.Name()).
-				Str("source", source.description()).
-				Int("listeners", len(conns)).
-				Msg("Serving HTTP/3 on tailnet")
+			log.Ctx(ctx).Info().Stringer("source", source).Int("listeners", len(conns)).Msg("Serving HTTP/3 on network source")
 
 			for _, conn := range conns {
 				wg.Go(func() { serve(conn) })
@@ -247,8 +232,7 @@ func (e *http3server) Switch(rt *tcprouter.Router) {
 }
 
 func (e *http3server) Shutdown(_ context.Context) error {
-	// Releases a Start still waiting for the tailnet to come up; a host
-	// entryPoint is never waiting, and closing the channel is harmless.
+	// Releases a Start still waiting for a network to come up.
 	e.closeOnce.Do(func() { close(e.done) })
 
 	// TODO: use e.Server.CloseGracefully() when available.

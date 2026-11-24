@@ -29,6 +29,7 @@ import (
 	"github.com/pires/go-proxyproto"
 	"github.com/rs/zerolog/log"
 	"github.com/traefik/traefik/v3/pkg/config/static"
+	"github.com/traefik/traefik/v3/pkg/network"
 	// Registers workload identity federation, which mints the auth key for a
 	// clientID from an ID token. Without it, tsnet ignores the client ID and
 	// joins with no auth key at all.
@@ -60,6 +61,10 @@ var ErrNoTailnets = errors.New("no tailnets configured")
 // refuses every operation, so callers need no configured-or-not checks.
 type Registry struct {
 	nodes map[string]*Node
+
+	// sources is where each entryPoint that is on a tailnet accepts, keyed
+	// by its name. It is set once, by New.
+	sources map[string]network.Sources
 
 	stopOnce sync.Once
 	stop     chan struct{}

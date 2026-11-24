@@ -20,9 +20,9 @@ var errClosedListener = errors.New("udp: listener closed")
 // Listener augments a session-oriented Listener over a UDP PacketConn.
 type Listener struct {
 	// pConn is a net.PacketConn rather than a *net.UDPConn because the
-	// packets do not always come from a host socket: a tailnet entryPoint
-	// reads them from the in-process userspace network stack. Only the
-	// PacketConn methods are used either way.
+	// packets do not always come from a host socket: a userspace network
+	// stack hands over a net.PacketConn of its own. Only the PacketConn
+	// methods are used either way.
 	pConn net.PacketConn
 
 	mu    sync.RWMutex

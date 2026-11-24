@@ -18,17 +18,10 @@ import (
 	"github.com/spiffe/go-spiffe/v2/svid/x509svid"
 	ptypes "github.com/traefik/paerser/types"
 	"github.com/traefik/traefik/v3/pkg/config/dynamic"
+	"github.com/traefik/traefik/v3/pkg/network"
 	traefiktls "github.com/traefik/traefik/v3/pkg/tls"
 	"github.com/traefik/traefik/v3/pkg/types"
 )
-
-// TailnetDialer dials over a named tailnet. It is implemented by
-// tailnet.Registry, which cannot be imported here: it depends on the static
-// configuration, whose dependency tree loops back into this package.
-type TailnetDialer interface {
-	DialContext(ctx context.Context, tailnet, network, addr string) (net.Conn, error)
-	Has(tailnet string) bool
-}
 
 // ClientConn is the interface that provides information about the client connection.
 type ClientConn interface {
@@ -47,7 +40,7 @@ type Dialer interface {
 }
 
 type tcpDialer struct {
-	dialContext      func(ctx context.Context, network, addr string) (net.Conn, error)
+	dialContext      network.DialContextFunc
 	terminationDelay time.Duration
 	proxyProtocol    *dynamic.ProxyProtocol
 }
@@ -119,7 +112,7 @@ type DialerManager struct {
 	serversTransportsMu sync.RWMutex
 	serversTransports   map[string]*dynamic.TCPServersTransport
 	spiffeX509Source    SpiffeX509Source
-	tailnetDialer       TailnetDialer
+	networks            network.Extension
 }
 
 // NewDialerManager creates a new DialerManager.
@@ -130,12 +123,10 @@ func NewDialerManager(spiffeX509Source SpiffeX509Source) *DialerManager {
 	}
 }
 
-// SetTailnetDialer sets the registry that transports with a tailnet option
-// dial through. It must be called before the first Build. A nil dialer is
-// valid: every tailnet dial then fails with a configuration error, rather
-// than silently going out over the host network.
-func (d *DialerManager) SetTailnetDialer(dialer TailnetDialer) {
-	d.tailnetDialer = dialer
+// SetNetworks sets the extension that gives the transports the ways to reach their servers that are not over the host network.
+// It must be called before the first Build.
+func (d *DialerManager) SetNetworks(networks network.Extension) {
+	d.networks = networks
 }
 
 // Update updates the TCP serversTransport configurations.
@@ -228,32 +219,12 @@ func (d *DialerManager) Build(config *dynamic.TCPServersLoadBalancer, isTLS bool
 		KeepAlive: time.Duration(st.DialKeepAlive),
 	}
 
-	dialContext := netDialer.DialContext
-	if st.Tailnet != "" {
-		// A dial over an unknown tailnet fails on use rather than at build
-		// time, mirroring the HTTP transport manager: falling back to the
-		// host network would be the one outcome a tailnet-bound transport
-		// must never have.
-		if d.tailnetDialer == nil || !d.tailnetDialer.Has(st.Tailnet) {
-			log.Warn().Msgf("TCPServersTransport references tailnet %q, which is not in the static configuration; connections through it will fail", st.Tailnet)
-		}
-
-		tailnetDialer := d.tailnetDialer
-		tailnetName := st.Tailnet
-		timeout := time.Duration(st.DialTimeout)
-
-		dialContext = func(ctx context.Context, network, addr string) (net.Conn, error) {
-			if tailnetDialer == nil {
-				return nil, fmt.Errorf("dialing %q over tailnet %q: no tailnets configured", addr, tailnetName)
-			}
-
-			if timeout > 0 {
-				var cancel context.CancelFunc
-				ctx, cancel = context.WithTimeout(ctx, timeout)
-				defer cancel()
-			}
-
-			return tailnetDialer.DialContext(ctx, tailnetName, network, addr)
+	dialContext := network.DialContextFunc(netDialer.DialContext)
+	if d.networks != nil {
+		// The extension answers for the transports that do not dial over the host network.
+		// One of those never falls back to the host dialer: the extension gives it a dialer that fails instead.
+		if dial, ok := d.networks.TCPDialer(st); ok {
+			dialContext = dial.WithTimeout(netDialer.Timeout)
 		}
 	}
 

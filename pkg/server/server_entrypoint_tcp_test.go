@@ -96,7 +96,7 @@ func testShutdown(t *testing.T, router *tcprouter.Router) {
 		Transport:        epConfig,
 		ForwardedHeaders: &static.ForwardedHeaders{},
 		HTTP2:            &static.HTTP2Config{},
-	}, nil, nil, nil)
+	}, nil, nil)
 	require.NoError(t, err)
 
 	conn, err := startEntrypoint(t, entryPoint, router)
@@ -183,7 +183,7 @@ func TestReadTimeoutWithoutFirstByte(t *testing.T) {
 		Transport:        epConfig,
 		ForwardedHeaders: &static.ForwardedHeaders{},
 		HTTP2:            &static.HTTP2Config{},
-	}, nil, nil, nil)
+	}, nil, nil)
 	require.NoError(t, err)
 
 	router, err := tcprouter.NewRouter(nil)
@@ -222,7 +222,7 @@ func TestReadTimeoutWithFirstByte(t *testing.T) {
 		Transport:        epConfig,
 		ForwardedHeaders: &static.ForwardedHeaders{},
 		HTTP2:            &static.HTTP2Config{},
-	}, nil, nil, nil)
+	}, nil, nil)
 	require.NoError(t, err)
 
 	router, err := tcprouter.NewRouter(nil)
@@ -264,7 +264,7 @@ func TestKeepAliveMaxRequests(t *testing.T) {
 		Transport:        epConfig,
 		ForwardedHeaders: &static.ForwardedHeaders{},
 		HTTP2:            &static.HTTP2Config{},
-	}, nil, nil, nil)
+	}, nil, nil)
 	require.NoError(t, err)
 
 	router, err := tcprouter.NewRouter(nil)
@@ -312,7 +312,7 @@ func TestKeepAliveMaxTime(t *testing.T) {
 		Transport:        epConfig,
 		ForwardedHeaders: &static.ForwardedHeaders{},
 		HTTP2:            &static.HTTP2Config{},
-	}, nil, nil, nil)
+	}, nil, nil)
 	require.NoError(t, err)
 
 	router, err := tcprouter.NewRouter(nil)
@@ -356,7 +356,7 @@ func TestKeepAliveH2c(t *testing.T) {
 		Transport:        epConfig,
 		ForwardedHeaders: &static.ForwardedHeaders{},
 		HTTP2:            &static.HTTP2Config{},
-	}, nil, nil, nil)
+	}, nil, nil)
 	require.NoError(t, err)
 
 	router, err := tcprouter.NewRouter(nil)
@@ -628,7 +628,7 @@ func TestAliasHeadersStrategy(t *testing.T) {
 				HTTP: static.HTTPConfig{
 					AliasHeadersStrategy: test.strategy,
 				},
-			}, nil, nil, nil)
+			}, nil, nil)
 			require.NoError(t, err)
 
 			router, err := tcprouter.NewRouter(nil)
@@ -1492,7 +1492,7 @@ func TestUnderscoreHeadersStrategy(t *testing.T) {
 				HTTP: static.HTTPConfig{
 					UnderscoreHeadersStrategy: test.strategy,
 				},
-			}, nil, nil, nil)
+			}, nil, nil)
 			require.NoError(t, err)
 
 			router, err := tcprouter.NewRouter(nil)
@@ -1605,7 +1605,7 @@ func TestHeaderNamesStrategiesWarnings(t *testing.T) {
 				ForwardedHeaders: &static.ForwardedHeaders{},
 				HTTP2:            &static.HTTP2Config{},
 				HTTP:             test.config,
-			}, nil, nil, nil)
+			}, nil, nil)
 			require.NoError(t, err)
 
 			// The counts guard against logging the warnings once per HTTP server instead of once per entry point.
@@ -1647,7 +1647,7 @@ func TestHeaderNamesStrategiesWarnings_GlobalDefault(t *testing.T) {
 		cfg.SetEffectiveConfiguration()
 		require.NoError(t, cfg.ValidateConfiguration())
 
-		_, err := NewTCPEntryPoint(ctx, "", cfg.EntryPoints["web"], nil, nil, nil)
+		_, err := NewTCPEntryPoint(ctx, "", cfg.EntryPoints["web"], nil, nil)
 		require.NoError(t, err)
 	}
 
@@ -1685,7 +1685,7 @@ func TestNewTCPEntryPoint_InvalidAliasHeadersStrategy(t *testing.T) {
 		ForwardedHeaders: &static.ForwardedHeaders{},
 		HTTP2:            &static.HTTP2Config{},
 		HTTP:             static.HTTPConfig{AliasHeadersStrategy: "foobar"},
-	}, nil, nil, nil)
+	}, nil, nil)
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "invalid aliasHeadersStrategy value")
 }
@@ -1901,7 +1901,7 @@ func TestStickyBackendTransportReleasedWithClientConnection(t *testing.T) {
 				Transport:        epConfig,
 				ForwardedHeaders: &static.ForwardedHeaders{},
 				HTTP2:            &static.HTTP2Config{},
-			}, nil, nil, nil)
+			}, nil, nil)
 			require.NoError(t, err)
 
 			conn, err := startEntrypoint(t, entryPoint, router)

@@ -10,8 +10,8 @@ import (
 )
 
 // wrappedPacketConn is a net.PacketConn that is not a *net.UDPConn, which is
-// what a tailnet entryPoint gets: its packets come from the in-process
-// userspace network stack rather than from a host socket.
+// what a userspace network stack hands over: its packets do not come from a
+// host socket.
 type wrappedPacketConn struct {
 	net.PacketConn
 }
@@ -46,7 +46,7 @@ func TestListenPacketConnAcceptsAnyPacketConn(t *testing.T) {
 	require.NoError(t, err)
 	t.Cleanup(func() { _ = client.Close() })
 
-	_, err = client.Write([]byte("tailnet"))
+	_, err = client.Write([]byte("hello"))
 	require.NoError(t, err)
 
 	require.NoError(t, client.SetReadDeadline(time.Now().Add(5*time.Second)))
@@ -55,7 +55,7 @@ func TestListenPacketConnAcceptsAnyPacketConn(t *testing.T) {
 	n, err := client.Read(buf)
 	require.NoError(t, err)
 
-	assert.Equal(t, "tailnet", string(buf[:n]))
+	assert.Equal(t, "hello", string(buf[:n]))
 }
 
 func TestListenPacketConnRequiresAConn(t *testing.T) {

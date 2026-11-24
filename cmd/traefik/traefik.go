@@ -224,14 +224,23 @@ func setupServer(staticConfiguration *static.Configuration) (*server.Server, err
 	tracer, tracerCloser := setupTracing(ctx, staticConfiguration.Tracing)
 	observabilityMgr := middleware.NewObservabilityMgr(*staticConfiguration, metricsRegistry, semConvMetricRegistry, accessLog, tracer, tracerCloser)
 
+	// Networks
+
+	// Built before the entryPoints, which take listeners from it,
+	// and before the transport managers, which dial through it.
+	networks, err := setupNetworks(staticConfiguration)
+	if err != nil {
+		return nil, fmt.Errorf("setting up networks: %w", err)
+	}
+
 	// Entrypoints
 
-	serverEntryPointsTCP, err := server.NewTCPEntryPoints(staticConfiguration.EntryPoints, staticConfiguration.HostResolver, metricsRegistry)
+	serverEntryPointsTCP, err := server.NewTCPEntryPoints(staticConfiguration.EntryPoints, staticConfiguration.HostResolver, metricsRegistry, networks)
 	if err != nil {
 		return nil, err
 	}
 
-	serverEntryPointsUDP, err := server.NewUDPEntryPoints(staticConfiguration.EntryPoints)
+	serverEntryPointsUDP, err := server.NewUDPEntryPoints(staticConfiguration.EntryPoints, networks)
 	if err != nil {
 		return nil, err
 	}
@@ -302,13 +311,18 @@ func setupServer(staticConfiguration *static.Configuration) (*server.Server, err
 	}
 
 	transportManager := service.NewTransportManager(spiffeX509Source)
+	transportManager.SetNetworks(networks)
 
 	var proxyBuilder service.ProxyBuilder = httputil.NewProxyBuilder(transportManager, semConvMetricRegistry)
 	if staticConfiguration.Experimental != nil && staticConfiguration.Experimental.FastProxy != nil {
-		proxyBuilder = proxy.NewSmartBuilder(transportManager, proxyBuilder, *staticConfiguration.Experimental.FastProxy)
+		smartBuilder := proxy.NewSmartBuilder(transportManager, proxyBuilder, *staticConfiguration.Experimental.FastProxy)
+		smartBuilder.SetNetworks(networks)
+
+		proxyBuilder = smartBuilder
 	}
 
 	dialerManager := tcp.NewDialerManager(spiffeX509Source)
+	dialerManager.SetNetworks(networks)
 	acmeHTTPHandler := getHTTPChallengeHandler(acmeProviders, httpChallengeProvider)
 	managerFactory := service.NewManagerFactory(*staticConfiguration, routinesPool, observabilityMgr, transportManager, proxyBuilder, acmeHTTPHandler, tlsManager)
 
@@ -400,7 +414,7 @@ func setupServer(staticConfiguration *static.Configuration) (*server.Server, err
 		}
 	})
 
-	return server.NewServer(routinesPool, serverEntryPointsTCP, serverEntryPointsUDP, watcher, observabilityMgr), nil
+	return server.NewServer(routinesPool, serverEntryPointsTCP, serverEntryPointsUDP, watcher, observabilityMgr, networks), nil
 }
 
 func getHTTPChallengeHandler(acmeProviders []*acme.Provider, httpChallengeProvider http.Handler) http.Handler {

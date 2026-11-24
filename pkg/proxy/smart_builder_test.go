@@ -1,7 +1,9 @@
 package proxy
 
 import (
+	"context"
 	"encoding/pem"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"testing"
@@ -11,6 +13,7 @@ import (
 	"github.com/stretchr/testify/require"
 	"github.com/traefik/traefik/v3/pkg/config/dynamic"
 	"github.com/traefik/traefik/v3/pkg/config/static"
+	"github.com/traefik/traefik/v3/pkg/network"
 	"github.com/traefik/traefik/v3/pkg/proxy/httputil"
 	"github.com/traefik/traefik/v3/pkg/server/service"
 	"github.com/traefik/traefik/v3/pkg/testhelpers"
@@ -19,10 +22,23 @@ import (
 	"golang.org/x/net/http2/h2c"
 )
 
+// everyTransportNetworks is a networks extension that answers for every serversTransport,
+// with a dial that is the host's.
+type everyTransportNetworks struct {
+	network.Nop
+}
+
+func (everyTransportNetworks) HTTPDialer(*dynamic.ServersTransport) (network.DialContextFunc, bool) {
+	return func(ctx context.Context, netw, addr string) (net.Conn, error) {
+		return (&net.Dialer{}).DialContext(ctx, netw, addr)
+	}, true
+}
+
 func TestSmartBuilder_Build(t *testing.T) {
 	tests := []struct {
 		desc             string
 		serversTransport dynamic.ServersTransport
+		networks         network.Extension
 		fastProxyConfig  static.FastProxyConfig
 		https            bool
 		h2c              bool
@@ -49,6 +65,18 @@ func TestSmartBuilder_Build(t *testing.T) {
 		{
 			desc:            "fastproxy with h2c",
 			h2c:             true,
+			fastProxyConfig: static.FastProxyConfig{Debug: true},
+			wantFastProxy:   false,
+		},
+		{
+			desc:            "fastproxy with a networks extension that does not answer for the transport",
+			networks:        network.Nop{},
+			fastProxyConfig: static.FastProxyConfig{Debug: true},
+			wantFastProxy:   true,
+		},
+		{
+			desc:            "fastproxy with a networks extension that answers for the transport",
+			networks:        everyTransportNetworks{},
 			fastProxyConfig: static.FastProxyConfig{Debug: true},
 			wantFastProxy:   false,
 		},
@@ -96,10 +124,12 @@ func TestSmartBuilder_Build(t *testing.T) {
 			}
 
 			transportManager := service.NewTransportManager(nil)
+			transportManager.SetNetworks(test.networks)
 			transportManager.Update(serversTransports)
 
 			httpProxyBuilder := httputil.NewProxyBuilder(transportManager, nil)
 			proxyBuilder := NewSmartBuilder(transportManager, httpProxyBuilder, test.fastProxyConfig)
+			proxyBuilder.SetNetworks(test.networks)
 
 			proxyHandler, err := proxyBuilder.Build("test", targetURL, false, false, time.Second)
 			require.NoError(t, err)

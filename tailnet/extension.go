@@ -18,6 +18,17 @@ import (
 // fails the dials of every serversTransport that names a tailnet.
 var _ network.Extension = (*Registry)(nil)
 
+// Extension builds the tailnets of a static configuration, as the networks
+// extension of the traefik command: it is what a main function hands to
+// app.Options.Networks.
+//
+// It is never a nil Extension, even without a tailnet, where it holds a nil
+// registry: a serversTransport that names a tailnet must fail to dial then,
+// and not reach its servers over the host network.
+func Extension(staticConfiguration *static.Configuration) (network.Extension, error) {
+	return New(staticConfiguration.Tailnets, staticConfiguration.EntryPoints)
+}
+
 // New builds the registry for the tailnets of a static configuration, and
 // resolves its entryPoints against them: which accept on a tailnet, and where
 // on it. A configuration that cannot be served is refused here, at startup,

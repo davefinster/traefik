@@ -22,6 +22,23 @@ One node serves both directions:
 - A **serversTransport** referencing a tailnet dials that transport's backends
   over it, resolving their names through the tailnet's MagicDNS.
 
+!!! info "Built from the `tailnet` module"
+
+    The embedded Tailscale node is not part of the `traefik` binary built from
+    `./cmd/traefik`. It lives in a Go module of its own, in the `tailnet`
+    directory of the repository, so that Traefik itself does not depend on
+    Tailscale. That module builds the same `traefik` command with the tailnets
+    linked in:
+
+    ```bash
+    make binary FLAGS="-C tailnet"   # tailnet/dist/<os>/<arch>/traefik
+    ```
+
+    A binary built without them does not ignore the options on this page. It
+    refuses to start with a configuration that sets any of them, and it fails
+    the connections of a serversTransport that references a tailnet, rather
+    than serve on the host network what was meant for a tailnet.
+
 !!! info "Not the Tailscale certificate resolver"
 
     This is unrelated to the

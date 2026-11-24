@@ -162,7 +162,7 @@ at the cost of two names.
 
 `mode: tun` on a `tailnets.<name>.services.<key>` entry. Traefik advertises
 the Service in TUN mode and takes delivery of its packets in an in-process
-gVisor stack (`pkg/tailnet/localstack.go`, fed by `pkg/tailnet/tundev.go`),
+gVisor stack (`tailnet/localstack.go`, fed by `tailnet/tundev.go`),
 so TCP and UDP entryPoints can both name one Service.
 
 Verified end to end against global-infrastructure with Traefik hosting and a

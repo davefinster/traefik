@@ -8,9 +8,49 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	"github.com/traefik/traefik/v3/pkg/config/dynamic"
+	"github.com/traefik/traefik/v3/pkg/config/static"
 	traefikservice "github.com/traefik/traefik/v3/pkg/server/service"
 	"github.com/traefik/traefik/v3/pkg/tcp"
 )
+
+func TestExtensionBuildsTheTailnets(t *testing.T) {
+	networks, err := Extension(&static.Configuration{
+		Tailnets:    testTailnets(t),
+		EntryPoints: static.EntryPoints{"web": tailnetEntryPoint("corp"), "host": tailnetEntryPoint("")},
+	})
+	require.NoError(t, err)
+	t.Cleanup(networks.Close)
+
+	assert.NotNil(t, networks.Sources("web").Primary)
+	assert.Nil(t, networks.Sources("host").Primary)
+}
+
+// Without a tailnet the registry is nil, and the extension must not be: a
+// serversTransport that names a tailnet has to fail to dial, not reach its
+// servers over the host network.
+func TestExtensionWithoutTailnets(t *testing.T) {
+	networks, err := Extension(&static.Configuration{EntryPoints: static.EntryPoints{"web": tailnetEntryPoint("")}})
+	require.NoError(t, err)
+
+	// The extension is there, and the registry it holds is not.
+	registry, ok := networks.(*Registry)
+	require.True(t, ok)
+	assert.Nil(t, registry)
+
+	_, ok = networks.HTTPDialer(&dynamic.ServersTransport{})
+	assert.False(t, ok)
+
+	dial, ok := networks.HTTPDialer(&dynamic.ServersTransport{Tailnet: "corp"})
+	require.True(t, ok)
+
+	_, err = dial(t.Context(), "tcp", "127.0.0.1:80")
+	require.ErrorIs(t, err, ErrNoTailnets)
+}
+
+func TestExtensionRefusesAConfigurationItCannotServe(t *testing.T) {
+	_, err := Extension(&static.Configuration{EntryPoints: static.EntryPoints{"web": tailnetEntryPoint("corp")}})
+	require.ErrorIs(t, err, ErrNoTailnets)
+}
 
 func TestRegistryAnswersOnlyForTransportsNamingATailnet(t *testing.T) {
 	testCases := []struct {

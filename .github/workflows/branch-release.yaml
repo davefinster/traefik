@@ -66,7 +66,13 @@ jobs:
         env:
           GOOS: linux
           GOARCH: ${{ matrix.arch }}
-        run: make binary
+        # The tailnets are in a module of their own, whose cmd/traefik is the
+        # traefik command with them linked in. -C builds from that module, and
+        # the binary lands in its dist directory.
+        run: |
+          make binary FLAGS="-C tailnet"
+          mkdir -p "dist/linux/${GOARCH}"
+          mv "tailnet/dist/linux/${GOARCH}/traefik" "dist/linux/${GOARCH}/traefik"
 
       - name: Package tar.gz
         run: |

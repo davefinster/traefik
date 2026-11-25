@@ -15,20 +15,20 @@ import (
 	"github.com/traefik/traefik/v3/pkg/network"
 )
 
-// fakeNetworks is a networks extension that answers for one serversTransport,
+// fakeNetworks is a networks extension that answers for the serversTransport of one name,
 // and reaches a fixed local address whatever the address it is asked for.
 type fakeNetworks struct {
 	network.Nop
 
-	served *dynamic.TCPServersTransport
+	served string
 	target string
 	err    error
 
 	seenAddr string
 }
 
-func (f *fakeNetworks) TCPDialer(serversTransport *dynamic.TCPServersTransport) (network.DialContextFunc, bool) {
-	if serversTransport != f.served {
+func (f *fakeNetworks) TCPDialer(name string, _ *dynamic.TCPServersTransport) (network.DialContextFunc, bool) {
+	if name != f.served {
 		return nil, false
 	}
 
@@ -75,7 +75,7 @@ func TestDialerDialsThroughTheNetworksExtension(t *testing.T) {
 	ln := payloadListener(t, "extension")
 
 	serversTransport := defaultTCPServersTransport()
-	networks := &fakeNetworks{served: serversTransport, target: ln.Addr().String()}
+	networks := &fakeNetworks{served: "test", target: ln.Addr().String()}
 
 	dialerManager := NewDialerManager(nil)
 	dialerManager.SetNetworks(networks)
@@ -103,7 +103,7 @@ func TestDialerOfTheNetworksExtensionNeverFallsBackToTheHostNetwork(t *testing.T
 	ln := payloadListener(t, "host")
 
 	serversTransport := defaultTCPServersTransport()
-	networks := &fakeNetworks{served: serversTransport, err: errors.New("network unavailable")}
+	networks := &fakeNetworks{served: "test", err: errors.New("network unavailable")}
 
 	dialerManager := NewDialerManager(nil)
 	dialerManager.SetNetworks(networks)
@@ -141,7 +141,7 @@ type blockingNetworks struct {
 	network.Nop
 }
 
-func (blockingNetworks) TCPDialer(*dynamic.TCPServersTransport) (network.DialContextFunc, bool) {
+func (blockingNetworks) TCPDialer(string, *dynamic.TCPServersTransport) (network.DialContextFunc, bool) {
 	return func(ctx context.Context, _, _ string) (net.Conn, error) {
 		<-ctx.Done()
 		return nil, ctx.Err()
@@ -152,7 +152,7 @@ func (blockingNetworks) TCPDialer(*dynamic.TCPServersTransport) (network.DialCon
 func TestDialerTheNetworksExtensionDoesNotAnswerForUsesTheHostNetwork(t *testing.T) {
 	ln := payloadListener(t, "host")
 
-	networks := &fakeNetworks{served: defaultTCPServersTransport(), target: "127.0.0.1:1"}
+	networks := &fakeNetworks{served: "other", target: "127.0.0.1:1"}
 
 	dialerManager := NewDialerManager(nil)
 	dialerManager.SetNetworks(networks)

@@ -9,6 +9,7 @@ import (
 	stdlog "log"
 	"net"
 	"net/http"
+	"net/netip"
 	"net/url"
 	"os"
 	"strings"
@@ -277,11 +278,8 @@ func (e *TCPEntryPoint) Start(ctx context.Context) {
 		if err != nil {
 			logger.Error().Err(err).Send()
 
-			if opErr, ok := errors.AsType[*net.OpError](err); ok && opErr.Temporary() {
-				continue
-			}
-
-			if urlErr, ok := errors.AsType[*url.Error](err); ok && urlErr.Temporary() {
+			// The same test as the merged listener's, which passes on only the errors this loop retries after.
+			if isTemporaryAcceptError(err) {
 				continue
 			}
 
@@ -293,7 +291,12 @@ func (e *TCPEntryPoint) Start(ctx context.Context) {
 
 		writeCloser, err := writeCloser(conn)
 		if err != nil {
-			panic(err)
+			// Not a panic: the connection may come from a source of the networks extension,
+			// and any peer of that network could then stop the process by connecting.
+			logger.Error().Err(err).Msg("Unable to serve the connection, closing it")
+			_ = conn.Close()
+
+			continue
 		}
 
 		safe.Go(func() {
@@ -498,13 +501,16 @@ func buildProxyProtocolListener(ctx context.Context, entryPoint *static.EntryPoi
 	}
 
 	proxyListener.Policy = func(upstream net.Addr) (proxyproto.Policy, error) {
-		ipAddr, ok := upstream.(*net.TCPAddr)
+		upstreamIP, ok := addrIP(upstream)
 		if !ok {
-			return proxyproto.REJECT, fmt.Errorf("type error %v", upstream)
+			// Not an error: one from a policy ends the listener, and with it the entryPoint.
+			// A peer with no IP to its address is in no list of trusted IPs.
+			log.Ctx(ctx).Debug().Msgf("Address %v has no IP to look for in trusted IPs list, ignoring ProxyProtocol Headers and bypass connection", upstream)
+			return proxyproto.IGNORE, nil
 		}
 
-		if !checker.ContainsIP(ipAddr.IP) {
-			log.Ctx(ctx).Debug().Msgf("IP %s is not in trusted IPs list, ignoring ProxyProtocol Headers and bypass connection", ipAddr.IP)
+		if !checker.ContainsIP(upstreamIP) {
+			log.Ctx(ctx).Debug().Msgf("IP %s is not in trusted IPs list, ignoring ProxyProtocol Headers and bypass connection", upstreamIP)
 			return proxyproto.IGNORE, nil
 		}
 		return proxyproto.USE, nil
@@ -513,6 +519,28 @@ func buildProxyProtocolListener(ctx context.Context, entryPoint *static.EntryPoi
 	log.Ctx(ctx).Info().Msgf("Enabling ProxyProtocol for trusted IPs %v", entryPoint.ProxyProtocol.TrustedIPs)
 
 	return proxyListener, nil
+}
+
+// addrIP returns the IP of a network address, when it has one.
+// A host socket has a *net.TCPAddr; a source of the networks extension has the address type of its network.
+func addrIP(addr net.Addr) (net.IP, bool) {
+	if addr == nil {
+		return nil, false
+	}
+
+	if tcpAddr, ok := addr.(*net.TCPAddr); ok {
+		return tcpAddr.IP, true
+	}
+
+	if addrPort, err := netip.ParseAddrPort(addr.String()); err == nil {
+		return addrPort.Addr().AsSlice(), true
+	}
+
+	if ip, err := netip.ParseAddr(addr.String()); err == nil {
+		return ip.AsSlice(), true
+	}
+
+	return nil, false
 }
 
 type onceCloseListener struct {

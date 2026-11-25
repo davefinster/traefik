@@ -57,24 +57,36 @@ type Extension interface {
 	Sources(entryPoint string) Sources
 
 	// HTTPDialer returns how an HTTP serversTransport reaches its servers,
-	// and false when it does so over the host network.
+	// and false when it does so over the host network. The transport comes
+	// with its name, as the dynamic configuration knows it: with the
+	// provider it is from (mytransport@file), and default@internal for the
+	// one a service uses when it names none. The name is what tells two
+	// transports with the same settings apart.
 	//
 	// A transport that asks for a network the Extension cannot give it still
 	// gets a dialer, one that fails: falling back to the host network would
 	// send the traffic the one way its configuration ruled out.
 	//
-	// It is called every time a proxy is built for the transport, so it
-	// should do no more than look the transport up. The transport's dial
-	// timeout arrives as the deadline of the context the dialer is called
-	// with.
-	HTTPDialer(serversTransport *dynamic.ServersTransport) (DialContextFunc, bool)
+	// It is called every time a proxy or a health check is built for the
+	// transport, so it should do no more than look the transport up. The
+	// timeout of whoever dials, the transport or the health check, arrives
+	// as the deadline of the context the dialer is called with.
+	HTTPDialer(name string, serversTransport *dynamic.ServersTransport) (DialContextFunc, bool)
 
-	// TCPDialer is HTTPDialer for a TCP serversTransport.
-	TCPDialer(serversTransport *dynamic.TCPServersTransport) (DialContextFunc, bool)
+	// TCPDialer is HTTPDialer for a TCP serversTransport. The connections
+	// its dialer opens must be able to close their write half, with a
+	// CloseWrite method as *net.TCPConn has: a TCP service fails the
+	// connections it cannot do that on.
+	TCPDialer(name string, serversTransport *dynamic.TCPServersTransport) (DialContextFunc, bool)
 
 	// Start is called once, before the entryPoints start accepting. It must
 	// not wait for the network: an Extension that has something to bring up
 	// does so in the background.
+	//
+	// ctx is done as soon as the shutdown begins, which is before Withdraw
+	// and before the entryPoints drain. It ends what Start is still bringing
+	// up, and must not end what the Extension serves: that lasts until
+	// Close.
 	Start(ctx context.Context)
 
 	// Withdraw is the first step of a graceful shutdown, called before any
@@ -85,7 +97,8 @@ type Extension interface {
 	Withdraw(ctx context.Context)
 
 	// Close is the last step of a shutdown, called once every entryPoint has
-	// stopped and nothing dials anymore.
+	// stopped and nothing dials anymore. It runs within the time the server
+	// allows itself to stop, past which the process is killed.
 	Close()
 }
 
@@ -98,10 +111,14 @@ type Nop struct{}
 func (Nop) Sources(string) Sources { return Sources{} }
 
 // HTTPDialer answers for no serversTransport.
-func (Nop) HTTPDialer(*dynamic.ServersTransport) (DialContextFunc, bool) { return nil, false }
+func (Nop) HTTPDialer(string, *dynamic.ServersTransport) (DialContextFunc, bool) {
+	return nil, false
+}
 
 // TCPDialer answers for no serversTransport.
-func (Nop) TCPDialer(*dynamic.TCPServersTransport) (DialContextFunc, bool) { return nil, false }
+func (Nop) TCPDialer(string, *dynamic.TCPServersTransport) (DialContextFunc, bool) {
+	return nil, false
+}
 
 // Start does nothing.
 func (Nop) Start(context.Context) {}
@@ -147,6 +164,10 @@ type Source interface {
 	// the network: a listener that cannot bind yet is returned all the same,
 	// and binds within Accept. A network that is slow or unreachable at
 	// startup then costs only the entryPoints that are on it.
+	//
+	// The connections it accepts must be able to close their write half, with
+	// a CloseWrite method as *net.TCPConn has: the entryPoint closes the ones
+	// that cannot.
 	Listen(ctx context.Context) net.Listener
 
 	// CarriesPackets reports whether the source can deliver datagrams at
@@ -159,5 +180,8 @@ type Source interface {
 	// stack has no wildcard socket to cover several. Unlike Listen it waits
 	// for the network, for as long as it takes, and gives up when ctx is
 	// done.
+	//
+	// The conns belong to the entryPoint from then on, which closes them
+	// when it shuts down.
 	ListenPacket(ctx context.Context) ([]net.PacketConn, error)
 }

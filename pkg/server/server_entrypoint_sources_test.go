@@ -168,6 +168,131 @@ func TestBuildListenerAppliesProxyProtocolToAPrimarySource(t *testing.T) {
 	}
 }
 
+// namedAddr is the address of a network that is not TCP/IP, or does not say so with a *net.TCPAddr.
+type namedAddr string
+
+func (a namedAddr) Network() string { return "fake" }
+
+func (a namedAddr) String() string { return string(a) }
+
+// remoteAddrListener accepts the connections of a listener, and gives them the remote address of another network.
+type remoteAddrListener struct {
+	net.Listener
+
+	remoteAddr net.Addr
+}
+
+func (l remoteAddrListener) Accept() (net.Conn, error) {
+	conn, err := l.Listener.Accept()
+	if err != nil {
+		return nil, err
+	}
+
+	return remoteAddrConn{Conn: conn, remoteAddr: l.remoteAddr}, nil
+}
+
+type remoteAddrConn struct {
+	net.Conn
+
+	remoteAddr net.Addr
+}
+
+func (c remoteAddrConn) RemoteAddr() net.Addr { return c.remoteAddr }
+
+func TestAddrIP(t *testing.T) {
+	testCases := []struct {
+		desc   string
+		addr   net.Addr
+		expect string
+	}{
+		{desc: "a TCP address", addr: &net.TCPAddr{IP: net.ParseIP("203.0.113.7"), Port: 4242}, expect: "203.0.113.7"},
+		{desc: "an IP and port of another type", addr: namedAddr("203.0.113.7:4242"), expect: "203.0.113.7"},
+		{desc: "an IPv6 and port of another type", addr: namedAddr("[2001:db8::7]:4242"), expect: "2001:db8::7"},
+		{desc: "an IP alone", addr: namedAddr("203.0.113.7"), expect: "203.0.113.7"},
+		{desc: "a name", addr: namedAddr("tunnel-7")},
+		{desc: "no address"},
+	}
+
+	for _, test := range testCases {
+		t.Run(test.desc, func(t *testing.T) {
+			ip, ok := addrIP(test.addr)
+
+			assert.Equal(t, test.expect != "", ok)
+			if test.expect != "" {
+				assert.True(t, ip.Equal(net.ParseIP(test.expect)), ip.String())
+			}
+		})
+	}
+}
+
+// The proxyProtocol of the entryPoint judges the peer by its IP, which a primary source may not report as a host socket does.
+// A peer it cannot judge is not trusted, and must not end the listener either: an error from the policy does.
+func TestBuildListenerProxyProtocolOnAPrimarySourceWithAnotherAddressType(t *testing.T) {
+	testCases := []struct {
+		desc         string
+		remoteAddr   net.Addr
+		expectRemote string
+	}{
+		{
+			desc:         "a trusted IP of another type",
+			remoteAddr:   namedAddr("10.0.0.7:4242"),
+			expectRemote: "203.0.113.7:4242",
+		},
+		{
+			desc:         "an untrusted IP of another type",
+			remoteAddr:   namedAddr("192.0.2.9:4242"),
+			expectRemote: "192.0.2.9:4242",
+		},
+		{
+			desc:         "an address with no IP",
+			remoteAddr:   namedAddr("tunnel-7"),
+			expectRemote: "tunnel-7",
+		},
+	}
+
+	for _, test := range testCases {
+		t.Run(test.desc, func(t *testing.T) {
+			source := streamSource(t, "primary")
+			source.listener = remoteAddrListener{Listener: source.listener, remoteAddr: test.remoteAddr}
+
+			config := sourcesEntryPoint("192.0.2.1:80")
+			config.ProxyProtocol = &static.ProxyProtocol{TrustedIPs: []string{"10.0.0.0/8"}}
+
+			listener, err := buildListener(t.Context(), "web", config, network.Sources{Primary: source})
+			require.NoError(t, err)
+			t.Cleanup(func() { _ = listener.Close() })
+
+			type accepted struct {
+				conn net.Conn
+				err  error
+			}
+
+			acceptedCh := make(chan accepted, 1)
+			go func() {
+				conn, err := listener.Accept()
+				acceptedCh <- accepted{conn: conn, err: err}
+			}()
+
+			client, err := net.DialTimeout("tcp", source.listener.Addr().String(), 5*time.Second)
+			require.NoError(t, err)
+			t.Cleanup(func() { _ = client.Close() })
+
+			_, err = client.Write([]byte("PROXY TCP4 203.0.113.7 198.51.100.1 4242 80\r\n"))
+			require.NoError(t, err)
+
+			select {
+			case got := <-acceptedCh:
+				require.NoError(t, got.err)
+				t.Cleanup(func() { _ = got.conn.Close() })
+
+				assert.Equal(t, test.expectRemote, got.conn.RemoteAddr().String())
+			case <-time.After(5 * time.Second):
+				t.Fatal("no connection was accepted")
+			}
+		})
+	}
+}
+
 // The reason additional sources exist: the entryPoint's host listener and its sources are one entryPoint,
 // and the host side serves while a source's network is still unreachable.
 func TestBuildListenerMergesAdditionalSources(t *testing.T) {
@@ -421,6 +546,15 @@ func TestUDPEntryPointOnAPrimarySource(t *testing.T) {
 
 	assert.Empty(t, entryPoint.listeners)
 	assert.Len(t, entryPoint.sources, 1)
+}
+
+// A source binds after the startup, so a timeout no listener accepts is refused before it.
+func TestUDPEntryPointOnAPrimarySourceRefusesAZeroTimeout(t *testing.T) {
+	config := udpSourcesEntryPoint("192.0.2.1:53/udp")
+	config.UDP.Timeout = 0
+
+	_, err := newUDPEntryPoint(config, "dns", network.Sources{Primary: pendingSource("primary", true)})
+	require.ErrorContains(t, err, "timeout should be greater than zero")
 }
 
 func TestUDPEntryPointRefusesASourceThatCarriesNoPackets(t *testing.T) {

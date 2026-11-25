@@ -66,7 +66,8 @@ func (r *Registry) Sources(entryPoint string) network.Sources {
 }
 
 // HTTPDialer returns the dial of a serversTransport that names a tailnet.
-func (r *Registry) HTTPDialer(serversTransport *dynamic.ServersTransport) (network.DialContextFunc, bool) {
+// The tailnet is in the settings of the transport, so its name decides nothing.
+func (r *Registry) HTTPDialer(_ string, serversTransport *dynamic.ServersTransport) (network.DialContextFunc, bool) {
 	if serversTransport == nil || serversTransport.Tailnet == "" {
 		return nil, false
 	}
@@ -79,7 +80,7 @@ func (r *Registry) HTTPDialer(serversTransport *dynamic.ServersTransport) (netwo
 }
 
 // TCPDialer returns the dial of a TCP serversTransport that names a tailnet.
-func (r *Registry) TCPDialer(serversTransport *dynamic.TCPServersTransport) (network.DialContextFunc, bool) {
+func (r *Registry) TCPDialer(_ string, serversTransport *dynamic.TCPServersTransport) (network.DialContextFunc, bool) {
 	if serversTransport == nil || serversTransport.Tailnet == "" {
 		return nil, false
 	}
@@ -103,8 +104,8 @@ func (r *Registry) dialer(tailnet string) network.DialContextFunc {
 }
 
 // warnedTailnets holds the unknown tailnets already warned about. The dialers
-// are asked for every time a proxy is built, which with the fast proxy
-// enabled is once per service on every configuration change.
+// are asked for every time a proxy or a health check is built, which is at
+// least once per service on every configuration change.
 var warnedTailnets sync.Map
 
 func warnUnknownTailnet(kind, tailnet, what string) {

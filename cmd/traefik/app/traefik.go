@@ -317,10 +317,7 @@ func setupServer(staticConfiguration *static.Configuration, options Options) (*s
 
 	var proxyBuilder service.ProxyBuilder = httputil.NewProxyBuilder(transportManager, semConvMetricRegistry)
 	if staticConfiguration.Experimental != nil && staticConfiguration.Experimental.FastProxy != nil {
-		smartBuilder := proxy.NewSmartBuilder(transportManager, proxyBuilder, *staticConfiguration.Experimental.FastProxy)
-		smartBuilder.SetNetworks(networks)
-
-		proxyBuilder = smartBuilder
+		proxyBuilder = proxy.NewSmartBuilder(transportManager, proxyBuilder, *staticConfiguration.Experimental.FastProxy)
 	}
 
 	dialerManager := tcp.NewDialerManager(spiffeX509Source)

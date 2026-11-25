@@ -28,7 +28,7 @@ type everyTransportNetworks struct {
 	network.Nop
 }
 
-func (everyTransportNetworks) HTTPDialer(*dynamic.ServersTransport) (network.DialContextFunc, bool) {
+func (everyTransportNetworks) HTTPDialer(string, *dynamic.ServersTransport) (network.DialContextFunc, bool) {
 	return func(ctx context.Context, netw, addr string) (net.Conn, error) {
 		return (&net.Dialer{}).DialContext(ctx, netw, addr)
 	}, true
@@ -129,7 +129,6 @@ func TestSmartBuilder_Build(t *testing.T) {
 
 			httpProxyBuilder := httputil.NewProxyBuilder(transportManager, nil)
 			proxyBuilder := NewSmartBuilder(transportManager, httpProxyBuilder, test.fastProxyConfig)
-			proxyBuilder.SetNetworks(test.networks)
 
 			proxyHandler, err := proxyBuilder.Build("test", targetURL, false, false, time.Second)
 			require.NoError(t, err)

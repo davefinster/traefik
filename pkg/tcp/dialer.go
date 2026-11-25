@@ -223,7 +223,7 @@ func (d *DialerManager) Build(config *dynamic.TCPServersLoadBalancer, isTLS bool
 	if d.networks != nil {
 		// The extension answers for the transports that do not dial over the host network.
 		// One of those never falls back to the host dialer: the extension gives it a dialer that fails instead.
-		if dial, ok := d.networks.TCPDialer(st); ok {
+		if dial, ok := d.networks.TCPDialer(name, st); ok {
 			dialContext = dial.WithTimeout(netDialer.Timeout)
 		}
 	}

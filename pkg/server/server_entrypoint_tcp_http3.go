@@ -35,6 +35,11 @@ type http3server struct {
 	done      chan struct{}
 	closeOnce sync.Once
 
+	// The packet conns the sources bound, which Shutdown closes:
+	// quic-go leaves open a conn it was handed, and nothing else holds them.
+	sourceConnsMu sync.Mutex
+	sourceConns   []net.PacketConn
+
 	lock   sync.RWMutex
 	getter func(data tcpmuxer.ConnData) (*tls.Config, string, error)
 }
@@ -191,16 +196,19 @@ func (e *http3server) Start(ctx context.Context) error {
 		errs = append(errs, err)
 	}
 
-	serve := func(conn net.PacketConn) {
+	serve := func(conn net.PacketConn) error {
 		// quic-go tracks its listeners individually,
 		// so one Serve per conn is how a single http3.Server covers them all.
-		if err := e.Serve(conn); err != nil {
+		err := e.Serve(conn)
+		if err != nil {
 			fail(err)
 		}
+
+		return err
 	}
 
 	if e.http3conn != nil {
-		wg.Go(func() { serve(e.http3conn) })
+		wg.Go(func() { _ = serve(e.http3conn) })
 	}
 
 	for _, source := range e.sources {
@@ -208,13 +216,30 @@ func (e *http3server) Start(ctx context.Context) error {
 			conns, err := source.ListenPacket(untilClosed(ctx, e.done))
 			if err != nil {
 				fail(err)
+
+				// The caller of Start has no use for its error, so a source that cannot bind is reported here.
+				select {
+				case <-e.done:
+					// The shutdown ended the wait for the network, which is no failure.
+				default:
+					log.Ctx(ctx).Error().Err(err).Stringer("source", source).Msg("Unable to serve HTTP/3 on network source")
+				}
+
+				return
+			}
+
+			if !e.adoptSourceConns(conns) {
 				return
 			}
 
 			log.Ctx(ctx).Info().Stringer("source", source).Int("listeners", len(conns)).Msg("Serving HTTP/3 on network source")
 
 			for _, conn := range conns {
-				wg.Go(func() { serve(conn) })
+				wg.Go(func() {
+					if err := serve(conn); err != nil && !errors.Is(err, http.ErrServerClosed) {
+						log.Ctx(ctx).Error().Err(err).Stringer("source", source).Msg("Error while serving HTTP/3 on network source")
+					}
+				})
 			}
 		})
 	}
@@ -236,7 +261,39 @@ func (e *http3server) Shutdown(_ context.Context) error {
 	e.closeOnce.Do(func() { close(e.done) })
 
 	// TODO: use e.Server.CloseGracefully() when available.
-	return e.Server.Close()
+	err := e.Server.Close()
+
+	// After the server, which has connections to close on these conns.
+	e.sourceConnsMu.Lock()
+	defer e.sourceConnsMu.Unlock()
+
+	for _, conn := range e.sourceConns {
+		_ = conn.Close()
+	}
+	e.sourceConns = nil
+
+	return err
+}
+
+// adoptSourceConns takes charge of the packet conns a source bound, for Shutdown to close.
+// It reports false, having closed them, when the server was shut down while the source was binding.
+func (e *http3server) adoptSourceConns(conns []net.PacketConn) bool {
+	e.sourceConnsMu.Lock()
+	defer e.sourceConnsMu.Unlock()
+
+	select {
+	case <-e.done:
+		for _, conn := range conns {
+			_ = conn.Close()
+		}
+
+		return false
+	default:
+	}
+
+	e.sourceConns = append(e.sourceConns, conns...)
+
+	return true
 }
 
 func (e *http3server) getTLSConfigForClient(info *tls.ClientHelloInfo) (*tls.Config, error) {

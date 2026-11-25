@@ -557,6 +557,11 @@ transport with `tailnet` set always uses the standard proxy implementation,
 even when the [FastProxy](./experimental/fastproxy.md) experimental option is
 enabled, because the fast proxy dials with its own dialer.
 
+Such a transport also ignores the `HTTP_PROXY`, `HTTPS_PROXY` and `NO_PROXY`
+environment variables: a proxy from the environment is on the host network, not
+on the tailnet. The health checks of a service go the same way as its requests,
+over the tailnet, the gRPC ones included.
+
 ## Joining as a Federated Identity
 
 Instead of an auth key, a node can join as a Tailscale

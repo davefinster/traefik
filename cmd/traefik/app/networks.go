@@ -59,11 +59,11 @@ type noTailnets struct {
 	network.Nop
 
 	// warned holds the tailnets already warned about:
-	// the dialers are asked for every time a proxy is built.
+	// the dialers are asked for every time a proxy or a health check is built.
 	warned sync.Map
 }
 
-func (n *noTailnets) HTTPDialer(serversTransport *dynamic.ServersTransport) (network.DialContextFunc, bool) {
+func (n *noTailnets) HTTPDialer(_ string, serversTransport *dynamic.ServersTransport) (network.DialContextFunc, bool) {
 	if serversTransport == nil || serversTransport.Tailnet == "" {
 		return nil, false
 	}
@@ -71,7 +71,7 @@ func (n *noTailnets) HTTPDialer(serversTransport *dynamic.ServersTransport) (net
 	return n.refuse(serversTransport.Tailnet), true
 }
 
-func (n *noTailnets) TCPDialer(serversTransport *dynamic.TCPServersTransport) (network.DialContextFunc, bool) {
+func (n *noTailnets) TCPDialer(_ string, serversTransport *dynamic.TCPServersTransport) (network.DialContextFunc, bool) {
 	if serversTransport == nil || serversTransport.Tailnet == "" {
 		return nil, false
 	}

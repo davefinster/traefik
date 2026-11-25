@@ -37,10 +37,10 @@ func TestExtensionWithoutTailnets(t *testing.T) {
 	require.True(t, ok)
 	assert.Nil(t, registry)
 
-	_, ok = networks.HTTPDialer(&dynamic.ServersTransport{})
+	_, ok = networks.HTTPDialer("test@file", &dynamic.ServersTransport{})
 	assert.False(t, ok)
 
-	dial, ok := networks.HTTPDialer(&dynamic.ServersTransport{Tailnet: "corp"})
+	dial, ok := networks.HTTPDialer("test@file", &dynamic.ServersTransport{Tailnet: "corp"})
 	require.True(t, ok)
 
 	_, err = dial(t.Context(), "tcp", "127.0.0.1:80")
@@ -63,26 +63,26 @@ func TestRegistryAnswersOnlyForTransportsNamingATailnet(t *testing.T) {
 
 	for _, test := range testCases {
 		t.Run(test.desc, func(t *testing.T) {
-			_, ok := test.registry.HTTPDialer(&dynamic.ServersTransport{})
+			_, ok := test.registry.HTTPDialer("test@file", &dynamic.ServersTransport{})
 			assert.False(t, ok)
 
-			_, ok = test.registry.HTTPDialer(nil)
+			_, ok = test.registry.HTTPDialer("test@file", nil)
 			assert.False(t, ok)
 
-			_, ok = test.registry.TCPDialer(&dynamic.TCPServersTransport{})
+			_, ok = test.registry.TCPDialer("test@file", &dynamic.TCPServersTransport{})
 			assert.False(t, ok)
 
-			_, ok = test.registry.TCPDialer(nil)
+			_, ok = test.registry.TCPDialer("test@file", nil)
 			assert.False(t, ok)
 
 			// Known or not, a tailnet that is named is answered for: the dial
 			// must fail rather than go out over the host network.
 			for _, name := range []string{"corp", "typo"} {
-				dial, ok := test.registry.HTTPDialer(&dynamic.ServersTransport{Tailnet: name})
+				dial, ok := test.registry.HTTPDialer("test@file", &dynamic.ServersTransport{Tailnet: name})
 				assert.True(t, ok)
 				assert.NotNil(t, dial)
 
-				dial, ok = test.registry.TCPDialer(&dynamic.TCPServersTransport{Tailnet: name})
+				dial, ok = test.registry.TCPDialer("test@file", &dynamic.TCPServersTransport{Tailnet: name})
 				assert.True(t, ok)
 				assert.NotNil(t, dial)
 			}

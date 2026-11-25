@@ -61,7 +61,15 @@ func newMergedListener(ctx context.Context, listeners []net.Listener) *mergedLis
 func (m *mergedListener) Accept() (net.Conn, error) {
 	select {
 	case conn := <-m.conns:
-		return conn, nil
+		// A connection and the close can both be ready, and select takes either:
+		// without this, a closed listener could still hand a connection out.
+		select {
+		case <-m.done:
+			_ = conn.Close()
+			return nil, net.ErrClosed
+		default:
+			return conn, nil
+		}
 	case err := <-m.errs:
 		return nil, err
 	case <-m.done:

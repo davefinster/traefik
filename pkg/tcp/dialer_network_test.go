@@ -15,20 +15,20 @@ import (
 	"github.com/traefik/traefik/v3/pkg/network"
 )
 
-// fakeNetworks is a networks extension that answers for one serversTransport,
+// fakeNetworks is a networks extension that answers for the serversTransport of one name,
 // and reaches a fixed local address whatever the address it is asked for.
 type fakeNetworks struct {
 	network.Nop
 
-	served *dynamic.TCPServersTransport
+	served string
 	target string
 	err    error
 
 	seenAddr string
 }
 
-func (f *fakeNetworks) TCPDialer(serversTransport *dynamic.TCPServersTransport) (network.DialContextFunc, bool) {
-	if serversTransport != f.served {
+func (f *fakeNetworks) TCPDialer(name string, _ *dynamic.TCPServersTransport) (network.DialContextFunc, bool) {
+	if name != f.served {
 		return nil, false
 	}
 
@@ -75,7 +75,7 @@ func TestDialerDialsThroughTheNetworksExtension(t *testing.T) {
 	ln := payloadListener(t, "extension")
 
 	serversTransport := defaultTCPServersTransport()
-	networks := &fakeNetworks{served: serversTransport, target: ln.Addr().String()}
+	networks := &fakeNetworks{served: "test", target: ln.Addr().String()}
 
 	dialerManager := NewDialerManager(nil)
 	dialerManager.SetNetworks(networks)
@@ -103,7 +103,7 @@ func TestDialerOfTheNetworksExtensionNeverFallsBackToTheHostNetwork(t *testing.T
 	ln := payloadListener(t, "host")
 
 	serversTransport := defaultTCPServersTransport()
-	networks := &fakeNetworks{served: serversTransport, err: errors.New("network unavailable")}
+	networks := &fakeNetworks{served: "test", err: errors.New("network unavailable")}
 
 	dialerManager := NewDialerManager(nil)
 	dialerManager.SetNetworks(networks)
@@ -141,7 +141,7 @@ type blockingNetworks struct {
 	network.Nop
 }
 
-func (blockingNetworks) TCPDialer(*dynamic.TCPServersTransport) (network.DialContextFunc, bool) {
+func (blockingNetworks) TCPDialer(string, *dynamic.TCPServersTransport) (network.DialContextFunc, bool) {
 	return func(ctx context.Context, _, _ string) (net.Conn, error) {
 		<-ctx.Done()
 		return nil, ctx.Err()
@@ -152,7 +152,7 @@ func (blockingNetworks) TCPDialer(*dynamic.TCPServersTransport) (network.DialCon
 func TestDialerTheNetworksExtensionDoesNotAnswerForUsesTheHostNetwork(t *testing.T) {
 	ln := payloadListener(t, "host")
 
-	networks := &fakeNetworks{served: defaultTCPServersTransport(), target: "127.0.0.1:1"}
+	networks := &fakeNetworks{served: "other", target: "127.0.0.1:1"}
 
 	dialerManager := NewDialerManager(nil)
 	dialerManager.SetNetworks(networks)
@@ -170,4 +170,63 @@ func TestDialerTheNetworksExtensionDoesNotAnswerForUsesTheHostNetwork(t *testing
 
 	assert.Equal(t, "host", string(payload))
 	assert.Empty(t, networks.seenAddr)
+}
+
+// halfCloselessDialer opens connections that cannot close their write half, as net.Pipe ones cannot.
+type halfCloselessDialer struct {
+	backend net.Conn
+}
+
+func (d halfCloselessDialer) Dial(string, string, ClientConn) (net.Conn, error) {
+	return d.backend, nil
+}
+
+func (d halfCloselessDialer) DialContext(context.Context, string, string, ClientConn) (net.Conn, error) {
+	return d.backend, nil
+}
+
+func (d halfCloselessDialer) TerminationDelay() time.Duration { return 0 }
+
+// A dialer is not always a host one, and the connections of another network are not always *net.TCPConn:
+// one that cannot close its write half fails the connection it was opened for, and not the process.
+func TestProxyRefusesABackendConnectionThatCannotCloseItsWriteHalf(t *testing.T) {
+	backend, backendPeer := net.Pipe()
+	t.Cleanup(func() { _ = backendPeer.Close() })
+
+	proxy, err := NewProxy("backend.invalid:8080", halfCloselessDialer{backend: backend})
+	require.NoError(t, err)
+
+	clientListener, err := net.Listen("tcp", "127.0.0.1:0")
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = clientListener.Close() })
+
+	served := make(chan struct{})
+	go func() {
+		defer close(served)
+
+		conn, err := clientListener.Accept()
+		if err != nil {
+			return
+		}
+
+		proxy.ServeTCP(conn.(*net.TCPConn))
+	}()
+
+	client, err := net.Dial("tcp", clientListener.Addr().String())
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = client.Close() })
+
+	select {
+	case <-served:
+	case <-time.After(5 * time.Second):
+		t.Fatal("the connection was not refused")
+	}
+
+	// The client connection is closed, and so is the backend one that could not be used.
+	require.NoError(t, client.SetReadDeadline(time.Now().Add(5*time.Second)))
+	_, err = client.Read(make([]byte, 1))
+	require.ErrorIs(t, err, io.EOF)
+
+	_, err = backendPeer.Read(make([]byte, 1))
+	require.ErrorIs(t, err, io.EOF)
 }

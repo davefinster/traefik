@@ -97,19 +97,19 @@ func TestSetupNetworksFailsTheDialsOverATailnetItWasNotBuiltWith(t *testing.T) {
 	require.NoError(t, err)
 	require.NotNil(t, networks)
 
-	_, ok := networks.HTTPDialer(&dynamic.ServersTransport{})
+	_, ok := networks.HTTPDialer("test@file", &dynamic.ServersTransport{})
 	assert.False(t, ok)
 
-	_, ok = networks.TCPDialer(&dynamic.TCPServersTransport{})
+	_, ok = networks.TCPDialer("test@file", &dynamic.TCPServersTransport{})
 	assert.False(t, ok)
 
-	dial, ok := networks.HTTPDialer(&dynamic.ServersTransport{Tailnet: "corp"})
+	dial, ok := networks.HTTPDialer("test@file", &dynamic.ServersTransport{Tailnet: "corp"})
 	require.True(t, ok)
 
 	_, err = dial(t.Context(), "tcp", "127.0.0.1:80")
 	require.ErrorIs(t, err, errNoTailnets)
 
-	dial, ok = networks.TCPDialer(&dynamic.TCPServersTransport{Tailnet: "corp"})
+	dial, ok = networks.TCPDialer("test@file", &dynamic.TCPServersTransport{Tailnet: "corp"})
 	require.True(t, ok)
 
 	_, err = dial(t.Context(), "tcp", "127.0.0.1:80")

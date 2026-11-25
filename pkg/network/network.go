@@ -83,9 +83,22 @@ type Sources struct {
 	Additional []Source
 }
 
+// All returns every source, the primary one first.
+func (s Sources) All() []Source {
+	if s.Primary == nil {
+		return s.Additional
+	}
+
+	all := make([]Source, 0, 1+len(s.Additional))
+	all = append(all, s.Primary)
+
+	return append(all, s.Additional...)
+}
+
 // Source is one place an entryPoint accepts on that is not a host socket.
 //
-// A Source is asked for a stream listener by a TCP entryPoint.
+// A Source is asked for a stream listener by a TCP entryPoint, and for packet
+// conns by a UDP entryPoint.
 type Source interface {
 	// String names the source, for logs and errors.
 	fmt.Stringer
@@ -99,4 +112,18 @@ type Source interface {
 	// a CloseWrite method as *net.TCPConn has: the entryPoint closes the ones
 	// that cannot.
 	Listen(ctx context.Context) net.Listener
+
+	// CarriesPackets reports whether the source can deliver datagrams at
+	// all. One that cannot is refused by a UDP entryPoint.
+	CarriesPackets() bool
+
+	// ListenPacket binds the source's packet conns and returns them
+	// together: one for each address the source has, as a userspace network
+	// stack has no wildcard socket to cover several. Unlike Listen it waits
+	// for the network, for as long as it takes, and gives up when ctx is
+	// done.
+	//
+	// The conns belong to the entryPoint from then on, which closes them
+	// when it shuts down.
+	ListenPacket(ctx context.Context) ([]net.PacketConn, error)
 }

@@ -10,6 +10,7 @@ import (
 	"github.com/stretchr/testify/require"
 	"github.com/traefik/traefik/v3/pkg/config/static"
 	"github.com/traefik/traefik/v3/pkg/network"
+	"github.com/traefik/traefik/v3/pkg/udp"
 )
 
 // fakeSource is a place to accept on that an entryPoint did not open itself.
@@ -19,11 +20,29 @@ type fakeSource struct {
 
 	// listener is what Listen returns.
 	listener net.Listener
+
+	// packets tells whether the source carries datagrams.
+	packets bool
+	// up is closed once the network the source is on has come up; ListenPacket waits for it.
+	up chan struct{}
+	// packetConns is what ListenPacket returns once the network is up.
+	packetConns []net.PacketConn
 }
 
 func (s *fakeSource) String() string { return s.name }
 
 func (s *fakeSource) Listen(context.Context) net.Listener { return s.listener }
+
+func (s *fakeSource) CarriesPackets() bool { return s.packets }
+
+func (s *fakeSource) ListenPacket(ctx context.Context) ([]net.PacketConn, error) {
+	select {
+	case <-s.up:
+		return s.packetConns, nil
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	}
+}
 
 // streamSource returns a source whose listener is a loopback one.
 func streamSource(t *testing.T, name string) *fakeSource {
@@ -36,9 +55,25 @@ func streamSource(t *testing.T, name string) *fakeSource {
 	return &fakeSource{name: name, listener: listener}
 }
 
-// pendingSource returns a source on a network that has not come up: its listener never accepts.
-func pendingSource(name string) *fakeSource {
-	return &fakeSource{name: name, listener: newStubListener()}
+// pendingSource returns a source on a network that has not come up:
+// its listener never accepts, and its packet conns are not bound.
+func pendingSource(name string, packets bool) *fakeSource {
+	return &fakeSource{name: name, listener: newStubListener(), packets: packets, up: make(chan struct{})}
+}
+
+// packetSource returns a source whose packet conn is a loopback one, on a network that has not come up yet.
+// The conn is wrapped, as the conn of a userspace network stack is not a *net.UDPConn either.
+func packetSource(t *testing.T, name string) (*fakeSource, net.Addr) {
+	t.Helper()
+
+	conn, err := net.ListenPacket("udp", "127.0.0.1:0")
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = conn.Close() })
+
+	source := pendingSource(name, true)
+	source.packetConns = []net.PacketConn{struct{ net.PacketConn }{conn}}
+
+	return source, conn.LocalAddr()
 }
 
 func sourcesEntryPoint(address string) *static.EntryPoint {
@@ -255,7 +290,7 @@ func TestBuildListenerProxyProtocolOnAPrimarySourceWithAnotherAddressType(t *tes
 // and the host side serves while a source's network is still unreachable.
 func TestBuildListenerMergesAdditionalSources(t *testing.T) {
 	up := streamSource(t, "up")
-	pending := pendingSource("pending")
+	pending := pendingSource("pending", false)
 
 	listener, err := buildListener(t.Context(), "web", sourcesEntryPoint("127.0.0.1:0"), network.Sources{Additional: []network.Source{up, pending}})
 	require.NoError(t, err)
@@ -321,4 +356,119 @@ func TestNewTCPEntryPointRefusesHTTP3OnAPrimarySource(t *testing.T) {
 
 	_, err := newTCPEntryPoint(t.Context(), "websecure", config, nil, nil, network.Sources{Primary: streamSource(t, "primary")})
 	require.ErrorContains(t, err, "HTTP/3 cannot be served on primary")
+}
+
+func udpSourcesEntryPoint(address string) *static.EntryPoint {
+	config := sourcesEntryPoint(address)
+	config.UDP = &static.UDPConfig{}
+	config.UDP.SetDefaults()
+
+	return config
+}
+
+func echoUDPHandler() udp.Handler {
+	return udp.HandlerFunc(func(conn *udp.Conn) {
+		for {
+			b := make([]byte, 1024)
+			n, err := conn.Read(b)
+			if err != nil {
+				return
+			}
+
+			_, _ = conn.Write(b[:n])
+		}
+	})
+}
+
+// A UDP entryPoint serves its host address straight away,
+// and each source once its network is up, all through the same handler.
+func TestUDPEntryPointServesItsSources(t *testing.T) {
+	source, sourceAddr := packetSource(t, "additional")
+
+	entryPoint, err := newUDPEntryPoint(udpSourcesEntryPoint("127.0.0.1:0/udp"), "dns", network.Sources{Additional: []network.Source{source}})
+	require.NoError(t, err)
+
+	started := make(chan struct{})
+	go func() {
+		defer close(started)
+		entryPoint.Start(t.Context())
+	}()
+	entryPoint.Switch(echoUDPHandler())
+
+	require.Len(t, entryPoint.listeners, 1)
+
+	host, err := net.Dial("udp", entryPoint.listeners[0].Addr().String())
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = host.Close() })
+
+	// The host address answers while the source's network is still down.
+	requireEcho(t, "host", host, 5*time.Second)
+
+	close(source.up)
+
+	client, err := net.Dial("udp", sourceAddr.String())
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = client.Close() })
+
+	require.Eventually(t, func() bool {
+		entryPoint.mu.Lock()
+		defer entryPoint.mu.Unlock()
+
+		return len(entryPoint.listeners) == 2
+	}, 5*time.Second, 10*time.Millisecond)
+
+	requireEcho(t, "source", client, 5*time.Second)
+
+	entryPoint.Shutdown(t.Context())
+
+	select {
+	case <-started:
+	case <-time.After(5 * time.Second):
+		t.Fatal("the entryPoint did not stop")
+	}
+}
+
+// A primary source takes the place of the entryPoint's own address: nothing is bound on the host.
+func TestUDPEntryPointOnAPrimarySource(t *testing.T) {
+	// The address is one nothing could bind, so an entryPoint at all proves the host was left alone.
+	entryPoint, err := newUDPEntryPoint(udpSourcesEntryPoint("192.0.2.1:53/udp"), "dns", network.Sources{Primary: pendingSource("primary", true)})
+	require.NoError(t, err)
+
+	assert.Empty(t, entryPoint.listeners)
+	assert.Len(t, entryPoint.sources, 1)
+}
+
+// A source binds after the startup, so a timeout no listener accepts is refused before it.
+func TestUDPEntryPointOnAPrimarySourceRefusesAZeroTimeout(t *testing.T) {
+	config := udpSourcesEntryPoint("192.0.2.1:53/udp")
+	config.UDP.Timeout = 0
+
+	_, err := newUDPEntryPoint(config, "dns", network.Sources{Primary: pendingSource("primary", true)})
+	require.ErrorContains(t, err, "timeout should be greater than zero")
+}
+
+func TestUDPEntryPointRefusesASourceThatCarriesNoPackets(t *testing.T) {
+	_, err := newUDPEntryPoint(udpSourcesEntryPoint("127.0.0.1:0/udp"), "dns", network.Sources{Additional: []network.Source{pendingSource("stream only", false)}})
+	require.ErrorContains(t, err, "stream only carries no packets")
+}
+
+// Shutting an entryPoint down releases a source that is still waiting for its network.
+func TestUDPEntryPointShutdownReleasesAPendingSource(t *testing.T) {
+	entryPoint, err := newUDPEntryPoint(udpSourcesEntryPoint("192.0.2.1:53/udp"), "dns", network.Sources{Primary: pendingSource("primary", true)})
+	require.NoError(t, err)
+
+	started := make(chan struct{})
+	go func() {
+		defer close(started)
+		entryPoint.Start(t.Context())
+	}()
+
+	time.Sleep(50 * time.Millisecond)
+	entryPoint.Shutdown(t.Context())
+
+	select {
+	case <-started:
+	case <-time.After(5 * time.Second):
+		t.Fatal("the entryPoint kept waiting for the network after it was shut down")
+	}
 }

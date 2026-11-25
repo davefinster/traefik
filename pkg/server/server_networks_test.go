@@ -41,6 +41,12 @@ func (n *recordingNetworks) String() string { return "recording source" }
 
 func (n *recordingNetworks) Listen(context.Context) net.Listener { return recordingListener{n} }
 
+func (n *recordingNetworks) CarriesPackets() bool { return false }
+
+func (n *recordingNetworks) ListenPacket(context.Context) ([]net.PacketConn, error) {
+	return nil, net.ErrClosed
+}
+
 func (n *recordingNetworks) record(event string) {
 	n.mu.Lock()
 	defer n.mu.Unlock()

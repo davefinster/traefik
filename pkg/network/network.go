@@ -98,7 +98,7 @@ func (s Sources) All() []Source {
 // Source is one place an entryPoint accepts on that is not a host socket.
 //
 // A Source is asked for a stream listener by a TCP entryPoint, and for packet
-// conns by a UDP entryPoint.
+// conns by a UDP entryPoint and by a TCP entryPoint serving HTTP/3.
 type Source interface {
 	// String names the source, for logs and errors.
 	fmt.Stringer
@@ -114,7 +114,8 @@ type Source interface {
 	Listen(ctx context.Context) net.Listener
 
 	// CarriesPackets reports whether the source can deliver datagrams at
-	// all. One that cannot is refused by a UDP entryPoint.
+	// all. One that cannot is refused by a UDP entryPoint, and left out of
+	// HTTP/3.
 	CarriesPackets() bool
 
 	// ListenPacket binds the source's packet conns and returns them

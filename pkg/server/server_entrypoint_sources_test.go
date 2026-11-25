@@ -2,14 +2,21 @@ package server
 
 import (
 	"context"
+	"crypto/tls"
+	"fmt"
+	"io"
 	"net"
+	"net/http"
 	"testing"
 	"time"
 
+	"github.com/quic-go/quic-go/http3"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	"github.com/traefik/traefik/v3/pkg/config/static"
 	"github.com/traefik/traefik/v3/pkg/network"
+	tcprouter "github.com/traefik/traefik/v3/pkg/server/router/tcp"
+	traefiktls "github.com/traefik/traefik/v3/pkg/tls"
 	"github.com/traefik/traefik/v3/pkg/udp"
 )
 
@@ -349,13 +356,116 @@ func TestBuildListenerKeepsProxyProtocolOffAdditionalSources(t *testing.T) {
 	}
 }
 
-// HTTP/3 is served on the entryPoint's own address on the host, which a primary source takes the place of.
-func TestNewTCPEntryPointRefusesHTTP3OnAPrimarySource(t *testing.T) {
-	config := sourcesEntryPoint("192.0.2.1:443")
+func TestNewHTTP3ServerSources(t *testing.T) {
+	testCases := []struct {
+		desc        string
+		sources     network.Sources
+		expectErr   string
+		expectHost  bool
+		expectNames []string
+	}{
+		{
+			desc:       "no source",
+			expectHost: true,
+		},
+		{
+			desc:        "a primary source takes the place of the host conn",
+			sources:     network.Sources{Primary: pendingSource("primary", true)},
+			expectNames: []string{"primary"},
+		},
+		{
+			desc:      "a primary source that carries no packets",
+			sources:   network.Sources{Primary: pendingSource("primary", false)},
+			expectErr: "http3 cannot be served on primary: it carries no packets",
+		},
+		{
+			desc: "an additional source that carries no packets is left out",
+			sources: network.Sources{Additional: []network.Source{
+				pendingSource("stream only", false),
+				pendingSource("packets", true),
+			}},
+			expectHost:  true,
+			expectNames: []string{"packets"},
+		},
+	}
+
+	for _, test := range testCases {
+		t.Run(test.desc, func(t *testing.T) {
+			config := sourcesEntryPoint("127.0.0.1:0")
+			config.HTTP3 = &static.HTTP3Config{}
+
+			// Building the whole entryPoint must not wait for the sources' networks.
+			entryPoint, err := newTCPEntryPoint(t.Context(), "websecure", config, nil, nil, test.sources)
+			if test.expectErr != "" {
+				require.ErrorContains(t, err, test.expectErr)
+				return
+			}
+			require.NoError(t, err)
+			t.Cleanup(func() { entryPoint.Shutdown(t.Context()) })
+
+			require.NotNil(t, entryPoint.http3Server)
+			assert.Equal(t, test.expectHost, entryPoint.http3Server.http3conn != nil)
+
+			var names []string
+			for _, source := range entryPoint.http3Server.sources {
+				names = append(names, source.String())
+			}
+			assert.Equal(t, test.expectNames, names)
+		})
+	}
+}
+
+// HTTP/3 is served on the packet conns a source binds once its network is up, which is after the entryPoint started.
+func TestHTTP3ServesOnASourceOnceItsNetworkIsUp(t *testing.T) {
+	certContent, err := localhostCert.Read()
+	require.NoError(t, err)
+
+	keyContent, err := localhostKey.Read()
+	require.NoError(t, err)
+
+	tlsCert, err := tls.X509KeyPair(certContent, keyContent)
+	require.NoError(t, err)
+
+	source, sourceAddr := packetSource(t, "additional")
+
+	config := sourcesEntryPoint("127.0.0.1:0")
 	config.HTTP3 = &static.HTTP3Config{}
 
-	_, err := newTCPEntryPoint(t.Context(), "websecure", config, nil, nil, network.Sources{Primary: streamSource(t, "primary")})
-	require.ErrorContains(t, err, "HTTP/3 cannot be served on primary")
+	entryPoint, err := newTCPEntryPoint(t.Context(), "websecure", config, nil, nil, network.Sources{Additional: []network.Source{source}})
+	require.NoError(t, err)
+
+	router, err := tcprouter.NewRouter(nil)
+	require.NoError(t, err)
+
+	router.AddHTTPTLSConfig("*", &tls.Config{Certificates: []tls.Certificate{tlsCert}}, traefiktls.DefaultTLSConfigName)
+	router.SetHTTPSHandler(http.HandlerFunc(func(rw http.ResponseWriter, _ *http.Request) {
+		rw.WriteHeader(http.StatusTeapot)
+	}), nil)
+
+	go entryPoint.Start(t.Context())
+	entryPoint.SwitchRouter(router)
+	t.Cleanup(func() { entryPoint.Shutdown(t.Context()) })
+
+	// The entryPoint is serving already; only now does the source's network come up.
+	time.Sleep(100 * time.Millisecond)
+	close(source.up)
+
+	transport := &http3.Transport{TLSClientConfig: &tls.Config{InsecureSkipVerify: true}}
+	t.Cleanup(func() { _ = transport.Close() })
+
+	client := &http.Client{Transport: transport, Timeout: 5 * time.Second}
+
+	require.EventuallyWithT(t, func(c *assert.CollectT) {
+		resp, err := client.Get(fmt.Sprintf("https://%s/", sourceAddr))
+		if !assert.NoError(c, err) {
+			return
+		}
+		defer resp.Body.Close()
+
+		_, _ = io.Copy(io.Discard, resp.Body)
+
+		assert.Equal(c, http.StatusTeapot, resp.StatusCode)
+	}, 10*time.Second, 100*time.Millisecond)
 }
 
 func udpSourcesEntryPoint(address string) *static.EntryPoint {

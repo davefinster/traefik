@@ -191,12 +191,6 @@ func NewTCPEntryPoint(ctx context.Context, name string, config *static.EntryPoin
 }
 
 func newTCPEntryPoint(ctx context.Context, name string, config *static.EntryPoint, hostResolverConfig *types.HostResolverConfig, openConnectionsGauge gokitmetrics.Gauge, sources network.Sources) (*TCPEntryPoint, error) {
-	// HTTP/3 is served on the entryPoint's own address on the host,
-	// which is the address a primary source takes the place of.
-	if sources.Primary != nil && config.HTTP3 != nil {
-		return nil, fmt.Errorf("creating HTTP3 server: HTTP/3 cannot be served on %s", sources.Primary)
-	}
-
 	tracker := newConnectionTracker(openConnectionsGauge)
 
 	listener, err := buildListener(ctx, name, config, sources)
@@ -227,7 +221,7 @@ func newTCPEntryPoint(ctx context.Context, name string, config *static.EntryPoin
 		return nil, fmt.Errorf("creating HTTPS server: %w", err)
 	}
 
-	h3Server, err := newHTTP3Server(ctx, name, config, httpsServer)
+	h3Server, err := newHTTP3Server(ctx, name, config, httpsServer, sources)
 	if err != nil {
 		return nil, fmt.Errorf("creating HTTP3 server: %w", err)
 	}
@@ -272,7 +266,7 @@ func (e *TCPEntryPoint) Start(ctx context.Context) {
 	logger.Debug().Msg("Starting TCP Server")
 
 	if e.http3Server != nil {
-		go func() { _ = e.http3Server.Start() }()
+		go func() { _ = e.http3Server.Start(ctx) }()
 	}
 
 	for {

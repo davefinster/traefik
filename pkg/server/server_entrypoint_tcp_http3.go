@@ -15,6 +15,7 @@ import (
 	"github.com/rs/zerolog/log"
 	"github.com/traefik/traefik/v3/pkg/config/static"
 	tcpmuxer "github.com/traefik/traefik/v3/pkg/muxer/tcp"
+	"github.com/traefik/traefik/v3/pkg/network"
 	"github.com/traefik/traefik/v3/pkg/proxy/fast"
 	tcprouter "github.com/traefik/traefik/v3/pkg/server/router/tcp"
 	"github.com/traefik/traefik/v3/pkg/server/service/kerberos"
@@ -26,11 +27,23 @@ type http3server struct {
 
 	http3conn net.PacketConn
 
+	// The sources' packet conns are not opened at construction:
+	// a source waits for its network before it binds them, which a constructor must not.
+	// Start binds each source on its own, and serves whatever it binds.
+	sources   []network.Source
+	done      chan struct{}
+	closeOnce sync.Once
+
+	// The packet conns the sources bound, which Shutdown closes:
+	// quic-go leaves open a conn it was handed, and nothing else holds them.
+	sourceConnsMu sync.Mutex
+	sourceConns   []net.PacketConn
+
 	lock   sync.RWMutex
 	getter func(data tcpmuxer.ConnData) (*tls.Config, string, error)
 }
 
-func newHTTP3Server(ctx context.Context, name string, config *static.EntryPoint, httpsServer *httpServer) (*http3server, error) {
+func newHTTP3Server(ctx context.Context, name string, config *static.EntryPoint, httpsServer *httpServer, sources network.Sources) (*http3server, error) {
 	var conn net.PacketConn
 	var err error
 
@@ -42,15 +55,32 @@ func newHTTP3Server(ctx context.Context, name string, config *static.EntryPoint,
 		return nil, errors.New("advertised port must be greater than or equal to zero")
 	}
 
+	var packetSources []network.Source
+	if sources.Primary != nil {
+		if !sources.Primary.CarriesPackets() {
+			return nil, fmt.Errorf("http3 cannot be served on %s: it carries no packets", sources.Primary)
+		}
+		packetSources = append(packetSources, sources.Primary)
+	}
+	for _, source := range sources.Additional {
+		if !source.CarriesPackets() {
+			// Not refused: the entryPoint may serve HTTP/3 on its other listeners,
+			// and a client reaching it through this source simply stays on TCP.
+			log.Ctx(ctx).Info().Msgf("HTTP/3 is not served on %s: it carries no packets", source)
+			continue
+		}
+		packetSources = append(packetSources, source)
+	}
+
 	// if we have predefined connections from socket activation
-	if socketActivation.isEnabled() {
+	if sources.Primary == nil && socketActivation.isEnabled() {
 		conn, err = socketActivation.getConn(name)
 		if err != nil {
 			log.Ctx(ctx).Warn().Err(err).Str("name", name).Msg("Unable to use socket activation for entrypoint")
 		}
 	}
 
-	if conn == nil {
+	if sources.Primary == nil && conn == nil {
 		listenConfig := newListenConfig(config)
 		conn, err = listenConfig.ListenPacket(ctx, "udp", config.GetAddress())
 		if err != nil {
@@ -60,6 +90,8 @@ func newHTTP3Server(ctx context.Context, name string, config *static.EntryPoint,
 
 	h3 := &http3server{
 		http3conn: conn,
+		sources:   packetSources,
+		done:      make(chan struct{}),
 		getter: func(data tcpmuxer.ConnData) (*tls.Config, string, error) {
 			return nil, "", errors.New("no TLS config")
 		},
@@ -132,8 +164,74 @@ func withReadTimeout(ctx context.Context, next http.Handler, timeout time.Durati
 	})
 }
 
-func (e *http3server) Start() error {
-	return e.Serve(e.http3conn)
+// Start serves HTTP/3: on the host packet conn opened at construction, when the entryPoint has one,
+// and on the packet conns of each source, bound here once its network allows.
+// A network that is slow to come up delays only its own conns.
+func (e *http3server) Start(ctx context.Context) error {
+	var (
+		wg     sync.WaitGroup
+		errsMu sync.Mutex
+		errs   []error
+	)
+
+	fail := func(err error) {
+		errsMu.Lock()
+		defer errsMu.Unlock()
+
+		errs = append(errs, err)
+	}
+
+	serve := func(conn net.PacketConn) error {
+		// quic-go tracks its listeners individually,
+		// so one Serve per conn is how a single http3.Server covers them all.
+		err := e.Serve(conn)
+		if err != nil {
+			fail(err)
+		}
+
+		return err
+	}
+
+	if e.http3conn != nil {
+		wg.Go(func() { _ = serve(e.http3conn) })
+	}
+
+	for _, source := range e.sources {
+		wg.Go(func() {
+			conns, err := source.ListenPacket(untilClosed(ctx, e.done))
+			if err != nil {
+				fail(err)
+
+				// The caller of Start has no use for its error, so a source that cannot bind is reported here.
+				select {
+				case <-e.done:
+					// The shutdown ended the wait for the network, which is no failure.
+				default:
+					log.Ctx(ctx).Error().Err(err).Stringer("source", source).Msg("Unable to serve HTTP/3 on network source")
+				}
+
+				return
+			}
+
+			if !e.adoptSourceConns(conns) {
+				return
+			}
+
+			log.Ctx(ctx).Info().Stringer("source", source).Int("listeners", len(conns)).Msg("Serving HTTP/3 on network source")
+
+			for _, conn := range conns {
+				wg.Go(func() {
+					if err := serve(conn); err != nil && !errors.Is(err, http.ErrServerClosed) {
+						log.Ctx(ctx).Error().Err(err).Stringer("source", source).Msg("Error while serving HTTP/3 on network source")
+					}
+				})
+			}
+		})
+	}
+
+	wg.Wait()
+
+	return errors.Join(errs...)
 }
 
 func (e *http3server) Switch(rt *tcprouter.Router) {
@@ -144,8 +242,43 @@ func (e *http3server) Switch(rt *tcprouter.Router) {
 }
 
 func (e *http3server) Shutdown(_ context.Context) error {
+	// Releases a Start still waiting for a network to come up.
+	e.closeOnce.Do(func() { close(e.done) })
+
 	// TODO: use e.Server.CloseGracefully() when available.
-	return e.Server.Close()
+	err := e.Server.Close()
+
+	// After the server, which has connections to close on these conns.
+	e.sourceConnsMu.Lock()
+	defer e.sourceConnsMu.Unlock()
+
+	for _, conn := range e.sourceConns {
+		_ = conn.Close()
+	}
+	e.sourceConns = nil
+
+	return err
+}
+
+// adoptSourceConns takes charge of the packet conns a source bound, for Shutdown to close.
+// It reports false, having closed them, when the server was shut down while the source was binding.
+func (e *http3server) adoptSourceConns(conns []net.PacketConn) bool {
+	e.sourceConnsMu.Lock()
+	defer e.sourceConnsMu.Unlock()
+
+	select {
+	case <-e.done:
+		for _, conn := range conns {
+			_ = conn.Close()
+		}
+
+		return false
+	default:
+	}
+
+	e.sourceConns = append(e.sourceConns, conns...)
+
+	return true
 }
 
 func (e *http3server) getTLSConfigForClient(info *tls.ClientHelloInfo) (*tls.Config, error) {

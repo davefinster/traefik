@@ -24,6 +24,9 @@ import (
 	"github.com/traefik/traefik/v3/pkg/types"
 )
 
+// defaultTransportName is the name of the serversTransport a service uses when it names none.
+const defaultTransportName = "default@internal"
+
 // SpiffeX509Source allows to retrieve a x509 SVID and bundle.
 type SpiffeX509Source interface {
 	x509svid.Source
@@ -118,7 +121,7 @@ func (t *TransportManager) Update(newConfigs map[string]*dynamic.ServersTranspor
 // GetRoundTripper gets a roundtripper corresponding to the given transport name.
 func (t *TransportManager) GetRoundTripper(name string) (http.RoundTripper, error) {
 	if len(name) == 0 {
-		name = "default@internal"
+		name = defaultTransportName
 	}
 
 	t.rtLock.RLock()
@@ -134,7 +137,7 @@ func (t *TransportManager) GetRoundTripper(name string) (http.RoundTripper, erro
 // Get gets transport by name.
 func (t *TransportManager) Get(name string) (*dynamic.ServersTransport, error) {
 	if len(name) == 0 {
-		name = "default@internal"
+		name = defaultTransportName
 	}
 
 	t.rtLock.RLock()
@@ -156,7 +159,7 @@ func (t *TransportManager) GetDialContext(name string) (network.DialContextFunc,
 	}
 
 	if len(name) == 0 {
-		name = "default@internal"
+		name = defaultTransportName
 	}
 
 	cfg, err := t.Get(name)
@@ -170,7 +173,7 @@ func (t *TransportManager) GetDialContext(name string) (network.DialContextFunc,
 // GetTLSConfig gets a TLS config  corresponding to the given transport name.
 func (t *TransportManager) GetTLSConfig(name string) (*tls.Config, error) {
 	if len(name) == 0 {
-		name = "default@internal"
+		name = defaultTransportName
 	}
 
 	t.rtLock.RLock()

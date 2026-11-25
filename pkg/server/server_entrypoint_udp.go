@@ -2,6 +2,7 @@ package server
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"net"
 	"slices"
@@ -122,6 +123,12 @@ func newUDPEntryPoint(config *static.EntryPoint, name string, sources network.So
 
 	// The primary source takes the place of the entryPoint's own address on the host.
 	if sources.Primary != nil {
+		// A host listener refuses such a timeout when it is created, which stops the startup.
+		// A source binds in Start, where the same refusal would only leave the entryPoint listening on nothing.
+		if timeout <= 0 {
+			return nil, errors.New("timeout should be greater than zero")
+		}
+
 		return ep, nil
 	}
 
@@ -169,6 +176,13 @@ func (ep *UDPEntryPoint) Start(ctx context.Context) {
 		wg.Go(func() {
 			listeners, err := ep.bind(ctx, source)
 			if err != nil {
+				select {
+				case <-ep.done:
+					// The shutdown ended the wait for the network, which is no failure.
+				default:
+					log.Ctx(ctx).Error().Err(err).Stringer("source", source).Msg("Unable to listen for UDP on network source")
+				}
+
 				return
 			}
 
@@ -203,11 +217,19 @@ func (ep *UDPEntryPoint) Shutdown(ctx context.Context) {
 	ep.mu.Unlock()
 
 	graceTimeOut := time.Duration(ep.transportConfiguration.LifeCycle.GraceTimeOut)
+
+	// Together: one after the other, each listener would go on accepting sessions while the ones before it drained,
+	// and the entryPoint would take the grace timeout once per listener to stop.
+	var wg sync.WaitGroup
 	for _, listener := range listeners {
-		if err := listener.Shutdown(graceTimeOut); err != nil {
-			logger.Error().Err(err).Send()
-		}
+		wg.Go(func() {
+			if err := listener.Shutdown(graceTimeOut); err != nil {
+				logger.Error().Err(err).Send()
+			}
+		})
 	}
+
+	wg.Wait()
 }
 
 // Switch replaces ep's handler with the one given as argument.

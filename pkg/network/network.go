@@ -147,6 +147,10 @@ type Source interface {
 	// the network: a listener that cannot bind yet is returned all the same,
 	// and binds within Accept. A network that is slow or unreachable at
 	// startup then costs only the entryPoints that are on it.
+	//
+	// The connections it accepts must be able to close their write half, with
+	// a CloseWrite method as *net.TCPConn has: the entryPoint closes the ones
+	// that cannot.
 	Listen(ctx context.Context) net.Listener
 
 	// CarriesPackets reports whether the source can deliver datagrams at
@@ -159,5 +163,8 @@ type Source interface {
 	// stack has no wildcard socket to cover several. Unlike Listen it waits
 	// for the network, for as long as it takes, and gives up when ctx is
 	// done.
+	//
+	// The conns belong to the entryPoint from then on, which closes them
+	// when it shuts down.
 	ListenPacket(ctx context.Context) ([]net.PacketConn, error)
 }

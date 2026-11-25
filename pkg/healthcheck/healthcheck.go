@@ -135,6 +135,12 @@ func NewServiceHealthChecker(ctx context.Context, metrics metricsHealthCheck, co
 	}
 }
 
+// SetDialContext sets how the gRPC health check reaches the servers, when that is not over the host network.
+// It must be called before the health check is launched.
+func (shc *ServiceHealthChecker) SetDialContext(dialContext network.DialContextFunc) {
+	shc.dialContext = dialContext
+}
+
 func (shc *ServiceHealthChecker) Launch(ctx context.Context) {
 	go shc.healthcheck(ctx, shc.unhealthyTargets, shc.unhealthyInterval)
 
@@ -294,12 +300,6 @@ func (shc *ServiceHealthChecker) newRequest(ctx context.Context, target *url.URL
 	}
 
 	return req, nil
-}
-
-// SetDialContext sets how the gRPC health check reaches the servers, when that is not over the host network.
-// It must be called before the health check is launched.
-func (shc *ServiceHealthChecker) SetDialContext(dialContext network.DialContextFunc) {
-	shc.dialContext = dialContext
 }
 
 // checkHealthGRPC returns an error with a meaningful description if the health check failed.

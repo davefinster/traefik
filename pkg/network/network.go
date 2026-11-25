@@ -1,28 +1,52 @@
 // Package network is the extension point for the networks Traefik serves on
 // besides the host's own.
 //
-// Out of the box an entryPoint listens on a host socket, and nothing here is
-// involved. An Extension adds places to listen that the host does not have: a
-// VPN node embedded in the process, for one, has no socket to bind.
+// Out of the box an entryPoint listens on a host socket and a serversTransport
+// dials through the host's network stack, and nothing here is involved. An
+// Extension adds places to listen and ways to dial that the host does not
+// have: a VPN node embedded in the process, for one, has neither a socket to
+// bind nor a route to dial over.
 //
 // The package holds no implementation and depends on none. An Extension is
 // built by whatever links one in, from its own part of the configuration, and
-// handed to the entryPoints and the server. With none, which is a nil
-// Extension, Traefik serves on the host network only.
+// handed to the entryPoints, the transport managers and the server. With none,
+// which is a nil Extension, Traefik serves on the host network only.
 package network
 
 import (
 	"context"
 	"fmt"
 	"net"
+	"time"
+
+	"github.com/traefik/traefik/v3/pkg/config/dynamic"
 )
 
+// DialContextFunc opens a connection to a server. It has the signature of
+// net.Dialer.DialContext, which is what it takes the place of.
+type DialContextFunc func(ctx context.Context, network, address string) (net.Conn, error)
+
+// WithTimeout bounds each dial with timeout, which net.Dialer does by itself
+// and a DialContextFunc from an Extension does not. Zero means no bound.
+func (d DialContextFunc) WithTimeout(timeout time.Duration) DialContextFunc {
+	if timeout <= 0 {
+		return d
+	}
+
+	return func(ctx context.Context, network, address string) (net.Conn, error) {
+		ctx, cancel := context.WithTimeout(ctx, timeout)
+		defer cancel()
+
+		return d(ctx, network, address)
+	}
+}
+
 // Extension supplies what the host network does not: places for entryPoints
-// to accept on.
+// to accept on, and ways for serversTransports to reach their servers.
 //
-// Which entryPoints it serves is the Extension's own business, decided from
-// its own configuration: the rest of Traefik asks, and falls back to the host
-// network when the answer is no.
+// Which entryPoints and serversTransports it serves is the Extension's own
+// business, decided from its own configuration: the rest of Traefik asks, and
+// falls back to the host network when the answer is no.
 type Extension interface {
 	// Sources returns where the named entryPoint accepts besides, or instead
 	// of, its own address on the host. The zero Sources means the entryPoint
@@ -31,6 +55,29 @@ type Extension interface {
 	// A configuration that cannot be honored is refused when the Extension
 	// is built, not here.
 	Sources(entryPoint string) Sources
+
+	// HTTPDialer returns how an HTTP serversTransport reaches its servers,
+	// and false when it does so over the host network. The transport comes
+	// with its name, as the dynamic configuration knows it: with the
+	// provider it is from (mytransport@file), and default@internal for the
+	// one a service uses when it names none. The name is what tells two
+	// transports with the same settings apart.
+	//
+	// A transport that asks for a network the Extension cannot give it still
+	// gets a dialer, one that fails: falling back to the host network would
+	// send the traffic the one way its configuration ruled out.
+	//
+	// It is called every time a proxy or a health check is built for the
+	// transport, so it should do no more than look the transport up. The
+	// timeout of whoever dials, the transport or the health check, arrives
+	// as the deadline of the context the dialer is called with.
+	HTTPDialer(name string, serversTransport *dynamic.ServersTransport) (DialContextFunc, bool)
+
+	// TCPDialer is HTTPDialer for a TCP serversTransport. The connections
+	// its dialer opens must be able to close their write half, with a
+	// CloseWrite method as *net.TCPConn has: a TCP service fails the
+	// connections it cannot do that on.
+	TCPDialer(name string, serversTransport *dynamic.TCPServersTransport) (DialContextFunc, bool)
 
 	// Start is called once, before the entryPoints start accepting. It must
 	// not wait for the network: an Extension that has something to bring up
@@ -50,18 +97,28 @@ type Extension interface {
 	Withdraw(ctx context.Context)
 
 	// Close is the last step of a shutdown, called once every entryPoint has
-	// stopped. It runs within the time the server allows itself to stop,
-	// past which the process is killed.
+	// stopped and nothing dials anymore. It runs within the time the server
+	// allows itself to stop, past which the process is killed.
 	Close()
 }
 
-// Nop is the Extension that supplies nothing: every entryPoint stays on the
-// host network. It is there to be embedded, by an Extension that answers for
-// only part of what the interface covers.
+// Nop is the Extension that supplies nothing: every entryPoint and every
+// serversTransport stays on the host network. It is there to be embedded, by
+// an Extension that answers for only part of what the interface covers.
 type Nop struct{}
 
 // Sources returns no source.
 func (Nop) Sources(string) Sources { return Sources{} }
+
+// HTTPDialer answers for no serversTransport.
+func (Nop) HTTPDialer(string, *dynamic.ServersTransport) (DialContextFunc, bool) {
+	return nil, false
+}
+
+// TCPDialer answers for no serversTransport.
+func (Nop) TCPDialer(string, *dynamic.TCPServersTransport) (DialContextFunc, bool) {
+	return nil, false
+}
 
 // Start does nothing.
 func (Nop) Start(context.Context) {}

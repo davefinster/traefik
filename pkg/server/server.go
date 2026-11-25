@@ -21,7 +21,7 @@ type Server struct {
 	udpEntryPoints   UDPEntryPoints
 	observabilityMgr *middleware.ObservabilityMgr
 
-	// networks gives the entryPoints what the host network does not.
+	// networks gives the entryPoints and the transports what the host network does not.
 	// It is nil when Traefik serves on the host network only.
 	networks network.Extension
 
@@ -32,7 +32,7 @@ type Server struct {
 }
 
 // NewServer returns an initialized Server.
-// The networks extension is the one the entryPoints were given, whose lifecycle the server drives;
+// The networks extension is the one the entryPoints and the transports were given, whose lifecycle the server drives;
 // it is nil when there is none.
 func NewServer(routinesPool *safe.Pool, entryPoints TCPEntryPoints, entryPointsUDP UDPEntryPoints, watcher *ConfigurationWatcher, observabilityMgr *middleware.ObservabilityMgr, networks network.Extension) *Server {
 	srv := &Server{
@@ -127,7 +127,8 @@ func (s *Server) Close() {
 	s.observabilityMgr.Close()
 
 	if s.networks != nil {
-		// Last: the extension backs the entryPoint listeners that have just been shut down.
+		// Last: the extension backs the entryPoint listeners that have just been shut down,
+		// and the transports that dialed through it.
 		s.networks.Close()
 	}
 

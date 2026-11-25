@@ -17,6 +17,7 @@ import (
 	ptypes "github.com/traefik/paerser/types"
 	"github.com/traefik/traefik/v3/pkg/config/dynamic"
 	"github.com/traefik/traefik/v3/pkg/config/runtime"
+	"github.com/traefik/traefik/v3/pkg/network"
 	"golang.org/x/sync/singleflight"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
@@ -61,6 +62,10 @@ type ServiceHealthChecker struct {
 	metrics metricsHealthCheck
 
 	client *http.Client
+
+	// dialContext is how the gRPC health check reaches the servers, when that is not over the host network.
+	// The HTTP health check needs none: it goes through the transport of the service, which has its own.
+	dialContext network.DialContextFunc
 
 	healthyTargets   chan target
 	unhealthyTargets chan target
@@ -128,6 +133,12 @@ func NewServiceHealthChecker(ctx context.Context, metrics metricsHealthCheck, co
 		client:            client,
 		metrics:           metrics,
 	}
+}
+
+// SetDialContext sets how the gRPC health check reaches the servers, when that is not over the host network.
+// It must be called before the health check is launched.
+func (shc *ServiceHealthChecker) SetDialContext(dialContext network.DialContextFunc) {
+	shc.dialContext = dialContext
 }
 
 func (shc *ServiceHealthChecker) Launch(ctx context.Context) {
@@ -305,6 +316,14 @@ func (shc *ServiceHealthChecker) checkHealthGRPC(ctx context.Context, serverURL 
 	switch shc.config.Scheme {
 	case "http", "h2c", "":
 		opts = append(opts, grpc.WithTransportCredentials(insecure.NewCredentials()))
+	}
+
+	if shc.dialContext != nil {
+		// gRPC dials by itself, with a dialer of its own on the host network,
+		// which is the one way a server on another network cannot be reached.
+		opts = append(opts, grpc.WithContextDialer(func(ctx context.Context, addr string) (net.Conn, error) {
+			return shc.dialContext(ctx, "tcp", addr)
+		}))
 	}
 
 	conn, err := grpc.DialContext(ctx, serverAddr, opts...)

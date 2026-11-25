@@ -21,6 +21,7 @@ import (
 	metricsMiddle "github.com/traefik/traefik/v3/pkg/middlewares/metrics"
 	"github.com/traefik/traefik/v3/pkg/middlewares/observability"
 	"github.com/traefik/traefik/v3/pkg/middlewares/retry"
+	"github.com/traefik/traefik/v3/pkg/network"
 	"github.com/traefik/traefik/v3/pkg/observability/logs"
 	"github.com/traefik/traefik/v3/pkg/proxy/httputil"
 	"github.com/traefik/traefik/v3/pkg/safe"
@@ -544,7 +545,7 @@ func (m *Manager) getLoadBalancerServiceHandler(ctx context.Context, serviceName
 			return nil, fmt.Errorf("getting RoundTripper: %w", err)
 		}
 
-		m.healthCheckers[serviceName] = healthcheck.NewServiceHealthChecker(
+		healthChecker := healthcheck.NewServiceHealthChecker(
 			ctx,
 			m.observabilityMgr.MetricsRegistry(),
 			service.HealthCheck,
@@ -554,6 +555,18 @@ func (m *Manager) getLoadBalancerServiceHandler(ctx context.Context, serviceName
 			healthCheckTargets,
 			serviceName,
 		)
+
+		// The gRPC health check does not go through the round tripper,
+		// and has to be told how the transport reaches its servers when that is not over the host network.
+		if dialers, ok := m.transportManager.(interface {
+			GetDialContext(name string) (network.DialContextFunc, bool)
+		}); ok {
+			if dialContext, ok := dialers.GetDialContext(service.ServersTransport); ok {
+				healthChecker.SetDialContext(dialContext)
+			}
+		}
+
+		m.healthCheckers[serviceName] = healthChecker
 	}
 
 	return lb, nil

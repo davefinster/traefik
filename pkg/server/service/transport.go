@@ -18,10 +18,14 @@ import (
 	"github.com/spiffe/go-spiffe/v2/spiffetls/tlsconfig"
 	"github.com/spiffe/go-spiffe/v2/svid/x509svid"
 	"github.com/traefik/traefik/v3/pkg/config/dynamic"
+	"github.com/traefik/traefik/v3/pkg/network"
 	"github.com/traefik/traefik/v3/pkg/server/service/kerberos"
 	traefiktls "github.com/traefik/traefik/v3/pkg/tls"
 	"github.com/traefik/traefik/v3/pkg/types"
 )
+
+// defaultTransportName is the name of the serversTransport a service uses when it names none.
+const defaultTransportName = "default@internal"
 
 // SpiffeX509Source allows to retrieve a x509 SVID and bundle.
 type SpiffeX509Source interface {
@@ -37,6 +41,7 @@ type TransportManager struct {
 	tlsConfigs    map[string]*tls.Config
 
 	spiffeX509Source SpiffeX509Source
+	networks         network.Extension
 }
 
 // NewTransportManager creates a new TransportManager.
@@ -47,6 +52,12 @@ func NewTransportManager(spiffeX509Source SpiffeX509Source) *TransportManager {
 		tlsConfigs:       make(map[string]*tls.Config),
 		spiffeX509Source: spiffeX509Source,
 	}
+}
+
+// SetNetworks sets the extension that gives the transports the ways to reach their servers that are not over the host network.
+// It must be called before the first Update.
+func (t *TransportManager) SetNetworks(networks network.Extension) {
+	t.networks = networks
 }
 
 // Update updates the transport configurations.
@@ -76,7 +87,7 @@ func (t *TransportManager) Update(newConfigs map[string]*dynamic.ServersTranspor
 		}
 		t.tlsConfigs[configName] = tlsConfig
 
-		t.roundTrippers[configName], err = t.createRoundTripper(newConfig, tlsConfig)
+		t.roundTrippers[configName], err = t.createRoundTripper(configName, newConfig, tlsConfig)
 		if err != nil {
 			log.Error().Err(err).Msgf("Could not configure HTTP Transport %s, fallback on default transport", configName)
 			t.roundTrippers[configName] = http.DefaultTransport
@@ -97,7 +108,7 @@ func (t *TransportManager) Update(newConfigs map[string]*dynamic.ServersTranspor
 		}
 		t.tlsConfigs[newConfigName] = tlsConfig
 
-		t.roundTrippers[newConfigName], err = t.createRoundTripper(newConfig, tlsConfig)
+		t.roundTrippers[newConfigName], err = t.createRoundTripper(newConfigName, newConfig, tlsConfig)
 		if err != nil {
 			log.Error().Err(err).Msgf("Could not configure HTTP Transport %s, fallback on default transport", newConfigName)
 			t.roundTrippers[newConfigName] = http.DefaultTransport
@@ -110,7 +121,7 @@ func (t *TransportManager) Update(newConfigs map[string]*dynamic.ServersTranspor
 // GetRoundTripper gets a roundtripper corresponding to the given transport name.
 func (t *TransportManager) GetRoundTripper(name string) (http.RoundTripper, error) {
 	if len(name) == 0 {
-		name = "default@internal"
+		name = defaultTransportName
 	}
 
 	t.rtLock.RLock()
@@ -126,7 +137,7 @@ func (t *TransportManager) GetRoundTripper(name string) (http.RoundTripper, erro
 // Get gets transport by name.
 func (t *TransportManager) Get(name string) (*dynamic.ServersTransport, error) {
 	if len(name) == 0 {
-		name = "default@internal"
+		name = defaultTransportName
 	}
 
 	t.rtLock.RLock()
@@ -139,10 +150,30 @@ func (t *TransportManager) Get(name string) (*dynamic.ServersTransport, error) {
 	return nil, fmt.Errorf("servers transport not found %s", name)
 }
 
+// GetDialContext gets how the transport with the given name reaches its servers,
+// and false when it does so over the host network.
+// It is for what dials the servers without going through the round tripper of the transport.
+func (t *TransportManager) GetDialContext(name string) (network.DialContextFunc, bool) {
+	if t.networks == nil {
+		return nil, false
+	}
+
+	if len(name) == 0 {
+		name = defaultTransportName
+	}
+
+	cfg, err := t.Get(name)
+	if err != nil {
+		return nil, false
+	}
+
+	return t.networks.HTTPDialer(name, cfg)
+}
+
 // GetTLSConfig gets a TLS config  corresponding to the given transport name.
 func (t *TransportManager) GetTLSConfig(name string) (*tls.Config, error) {
 	if len(name) == 0 {
-		name = "default@internal"
+		name = defaultTransportName
 	}
 
 	t.rtLock.RLock()
@@ -280,9 +311,9 @@ func (c connWithTimeouts) Write(b []byte) (n int, err error) {
 	return n, nil
 }
 
-func customDialContext(d *net.Dialer, cfg *dynamic.ForwardingTimeouts) func(ctx context.Context, network string, address string) (net.Conn, error) {
-	return func(ctx context.Context, network, address string) (net.Conn, error) {
-		conn, err := d.DialContext(ctx, network, address)
+func customDialContext(dial network.DialContextFunc, cfg *dynamic.ForwardingTimeouts) network.DialContextFunc {
+	return func(ctx context.Context, netw, address string) (net.Conn, error) {
+		conn, err := dial(ctx, netw, address)
 
 		if cfg.ReadTimeout <= 0 && cfg.WriteTimeout <= 0 {
 			return conn, err
@@ -301,7 +332,7 @@ func customDialContext(d *net.Dialer, cfg *dynamic.ForwardingTimeouts) func(ctx 
 // For the settings that can't be configured in Traefik it uses the default http.Transport settings.
 // An exception to this is the MaxIdleConns setting as we only provide the option MaxIdleConnsPerHost in Traefik at this point in time.
 // Setting this value to the default of 100 could lead to confusing behavior and backwards compatibility issues.
-func (t *TransportManager) createRoundTripper(cfg *dynamic.ServersTransport, tlsConfig *tls.Config) (http.RoundTripper, error) {
+func (t *TransportManager) createRoundTripper(name string, cfg *dynamic.ServersTransport, tlsConfig *tls.Config) (http.RoundTripper, error) {
 	if cfg == nil {
 		return nil, errors.New("no transport configuration given")
 	}
@@ -315,9 +346,24 @@ func (t *TransportManager) createRoundTripper(cfg *dynamic.ServersTransport, tls
 		dialer.Timeout = time.Duration(cfg.ForwardingTimeouts.DialTimeout)
 	}
 
+	dialContext := network.DialContextFunc(dialer.DialContext)
+	proxy := http.ProxyFromEnvironment
+	if t.networks != nil {
+		// The extension answers for the transports that do not dial over the host network.
+		// One of those never falls back to the host dialer: the extension gives it a dialer that fails instead.
+		if dial, ok := t.networks.HTTPDialer(name, cfg); ok {
+			dialContext = dial.WithTimeout(dialer.Timeout)
+
+			// The proxies of the environment are the host network's way out.
+			// Kept, the extension would be asked to dial the proxy instead of the server,
+			// on a network the proxy is not on.
+			proxy = nil
+		}
+	}
+
 	transport := &http.Transport{
-		Proxy:                 http.ProxyFromEnvironment,
-		DialContext:           dialer.DialContext,
+		Proxy:                 proxy,
+		DialContext:           dialContext,
 		MaxIdleConnsPerHost:   cfg.MaxIdleConnsPerHost,
 		IdleConnTimeout:       90 * time.Second,
 		TLSHandshakeTimeout:   10 * time.Second,
@@ -330,7 +376,7 @@ func (t *TransportManager) createRoundTripper(cfg *dynamic.ServersTransport, tls
 	if cfg.ForwardingTimeouts != nil {
 		transport.ResponseHeaderTimeout = time.Duration(cfg.ForwardingTimeouts.ResponseHeaderTimeout)
 		transport.IdleConnTimeout = time.Duration(cfg.ForwardingTimeouts.IdleConnTimeout)
-		transport.DialContext = customDialContext(dialer, cfg.ForwardingTimeouts)
+		transport.DialContext = customDialContext(dialContext, cfg.ForwardingTimeouts)
 		// The forwarding timeout names come from the x/net/http2.Transport fields (ReadIdleTimeout/PingTimeout),
 		// which were used to configure the HTTP/2 health checks before the net/http native support (Go 1.24).
 		// HTTP2Config.SendPingTimeout carries the same semantics as ReadIdleTimeout:

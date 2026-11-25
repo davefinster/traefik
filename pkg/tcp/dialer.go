@@ -18,6 +18,7 @@ import (
 	"github.com/spiffe/go-spiffe/v2/svid/x509svid"
 	ptypes "github.com/traefik/paerser/types"
 	"github.com/traefik/traefik/v3/pkg/config/dynamic"
+	"github.com/traefik/traefik/v3/pkg/network"
 	traefiktls "github.com/traefik/traefik/v3/pkg/tls"
 	"github.com/traefik/traefik/v3/pkg/types"
 )
@@ -39,7 +40,7 @@ type Dialer interface {
 }
 
 type tcpDialer struct {
-	dialer           *net.Dialer
+	dialContext      network.DialContextFunc
 	terminationDelay time.Duration
 	proxyProtocol    *dynamic.ProxyProtocol
 }
@@ -56,7 +57,7 @@ func (d tcpDialer) Dial(network, addr string, clientConn ClientConn) (net.Conn, 
 
 // DialContext dials a network connection and optionally sends a PROXY protocol header, with context.
 func (d tcpDialer) DialContext(ctx context.Context, network, addr string, clientConn ClientConn) (net.Conn, error) {
-	conn, err := d.dialer.DialContext(ctx, network, addr)
+	conn, err := d.dialContext(ctx, network, addr)
 	if err != nil {
 		return nil, err
 	}
@@ -111,6 +112,7 @@ type DialerManager struct {
 	serversTransportsMu sync.RWMutex
 	serversTransports   map[string]*dynamic.TCPServersTransport
 	spiffeX509Source    SpiffeX509Source
+	networks            network.Extension
 }
 
 // NewDialerManager creates a new DialerManager.
@@ -119,6 +121,12 @@ func NewDialerManager(spiffeX509Source SpiffeX509Source) *DialerManager {
 		serversTransports: make(map[string]*dynamic.TCPServersTransport),
 		spiffeX509Source:  spiffeX509Source,
 	}
+}
+
+// SetNetworks sets the extension that gives the transports the ways to reach their servers that are not over the host network.
+// It must be called before the first Build.
+func (d *DialerManager) SetNetworks(networks network.Extension) {
+	d.networks = networks
 }
 
 // Update updates the TCP serversTransport configurations.
@@ -206,11 +214,22 @@ func (d *DialerManager) Build(config *dynamic.TCPServersLoadBalancer, isTLS bool
 		}
 	}
 
+	netDialer := &net.Dialer{
+		Timeout:   time.Duration(st.DialTimeout),
+		KeepAlive: time.Duration(st.DialKeepAlive),
+	}
+
+	dialContext := network.DialContextFunc(netDialer.DialContext)
+	if d.networks != nil {
+		// The extension answers for the transports that do not dial over the host network.
+		// One of those never falls back to the host dialer: the extension gives it a dialer that fails instead.
+		if dial, ok := d.networks.TCPDialer(name, st); ok {
+			dialContext = dial.WithTimeout(netDialer.Timeout)
+		}
+	}
+
 	dialer := tcpDialer{
-		dialer: &net.Dialer{
-			Timeout:   time.Duration(st.DialTimeout),
-			KeepAlive: time.Duration(st.DialKeepAlive),
-		},
+		dialContext:      dialContext,
 		terminationDelay: time.Duration(terminationDelay),
 		proxyProtocol:    proxyProtocol,
 	}

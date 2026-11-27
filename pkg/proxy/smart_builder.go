@@ -9,8 +9,8 @@ import (
 
 	"github.com/traefik/traefik/v3/pkg/config/dynamic"
 	"github.com/traefik/traefik/v3/pkg/config/static"
+	"github.com/traefik/traefik/v3/pkg/network"
 	"github.com/traefik/traefik/v3/pkg/proxy/fast"
-	"github.com/traefik/traefik/v3/pkg/proxy/httputil"
 	"github.com/traefik/traefik/v3/pkg/server/service"
 )
 
@@ -19,6 +19,7 @@ type TransportManager interface {
 	Get(name string) (*dynamic.ServersTransport, error)
 	GetRoundTripper(name string) (http.RoundTripper, error)
 	GetTLSConfig(name string) (*tls.Config, error)
+	GetDialContext(name string) (network.DialContextFunc, bool)
 }
 
 // SmartBuilder is a proxy builder which returns a fast proxy or httputil proxy corresponding
@@ -27,7 +28,7 @@ type SmartBuilder struct {
 	fastProxyBuilder *fast.ProxyBuilder
 	proxyBuilder     service.ProxyBuilder
 
-	transportManager httputil.TransportManager
+	transportManager TransportManager
 }
 
 // NewSmartBuilder creates and returns a new SmartBuilder instance.
@@ -49,6 +50,12 @@ func (b *SmartBuilder) Build(configName string, targetURL *url.URL, passHostHead
 	serversTransport, err := b.transportManager.Get(configName)
 	if err != nil {
 		return nil, fmt.Errorf("getting ServersTransport: %w", err)
+	}
+
+	// The fast proxy dials with a net.Dialer of its own,
+	// which would reach the servers over the host network whatever the networks extension says of the transport.
+	if _, ok := b.transportManager.GetDialContext(configName); ok {
+		return b.proxyBuilder.Build(configName, targetURL, passHostHeader, preservePath, flushInterval)
 	}
 
 	// The fast proxy implementation cannot handle HTTP/2 requests for now.

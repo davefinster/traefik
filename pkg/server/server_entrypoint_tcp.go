@@ -9,6 +9,7 @@ import (
 	stdlog "log"
 	"net"
 	"net/http"
+	"net/netip"
 	"net/url"
 	"os"
 	"strings"
@@ -28,6 +29,7 @@ import (
 	"github.com/traefik/traefik/v3/pkg/middlewares/contenttype"
 	"github.com/traefik/traefik/v3/pkg/middlewares/forwardedheaders"
 	"github.com/traefik/traefik/v3/pkg/middlewares/requestdecorator"
+	"github.com/traefik/traefik/v3/pkg/network"
 	"github.com/traefik/traefik/v3/pkg/observability/logs"
 	"github.com/traefik/traefik/v3/pkg/observability/metrics"
 	"github.com/traefik/traefik/v3/pkg/proxy/fast"
@@ -104,7 +106,9 @@ func (h *httpForwarder) Close() error {
 type TCPEntryPoints map[string]*TCPEntryPoint
 
 // NewTCPEntryPoints creates a new TCPEntryPoints.
-func NewTCPEntryPoints(entryPointsConfig static.EntryPoints, hostResolverConfig *types.HostResolverConfig, metricsRegistry metrics.Registry) (TCPEntryPoints, error) {
+// The networks extension gives the entryPoints the places they accept on that are not on the host;
+// it is nil when there is none.
+func NewTCPEntryPoints(entryPointsConfig static.EntryPoints, hostResolverConfig *types.HostResolverConfig, metricsRegistry metrics.Registry, networks network.Extension) (TCPEntryPoints, error) {
 	if os.Getenv(debugConnectionEnv) != "" {
 		expvar.Publish("clientConnectionStates", expvar.Func(func() any {
 			return clientConnectionStates
@@ -128,7 +132,7 @@ func NewTCPEntryPoints(entryPointsConfig static.EntryPoints, hostResolverConfig 
 			OpenConnectionsGauge().
 			With("entrypoint", entryPointName, "protocol", "TCP")
 
-		serverEntryPointsTCP[entryPointName], err = NewTCPEntryPoint(ctx, entryPointName, config, hostResolverConfig, openConnectionsGauge)
+		serverEntryPointsTCP[entryPointName], err = newTCPEntryPoint(ctx, entryPointName, config, hostResolverConfig, openConnectionsGauge, entryPointSources(networks, entryPointName))
 		if err != nil {
 			return nil, fmt.Errorf("error while building entryPoint %s: %w", entryPointName, err)
 		}
@@ -180,11 +184,15 @@ type TCPEntryPoint struct {
 	inShutdown atomic.Bool
 }
 
-// NewTCPEntryPoint creates a new TCPEntryPoint.
+// NewTCPEntryPoint creates a new TCPEntryPoint, on the host network.
 func NewTCPEntryPoint(ctx context.Context, name string, config *static.EntryPoint, hostResolverConfig *types.HostResolverConfig, openConnectionsGauge gokitmetrics.Gauge) (*TCPEntryPoint, error) {
+	return newTCPEntryPoint(ctx, name, config, hostResolverConfig, openConnectionsGauge, network.Sources{})
+}
+
+func newTCPEntryPoint(ctx context.Context, name string, config *static.EntryPoint, hostResolverConfig *types.HostResolverConfig, openConnectionsGauge gokitmetrics.Gauge, sources network.Sources) (*TCPEntryPoint, error) {
 	tracker := newConnectionTracker(openConnectionsGauge)
 
-	listener, err := buildListener(ctx, name, config)
+	listener, err := buildListener(ctx, name, config, sources)
 	if err != nil {
 		return nil, fmt.Errorf("building listener: %w", err)
 	}
@@ -212,7 +220,7 @@ func NewTCPEntryPoint(ctx context.Context, name string, config *static.EntryPoin
 		return nil, fmt.Errorf("creating HTTPS server: %w", err)
 	}
 
-	h3Server, err := newHTTP3Server(ctx, name, config, httpsServer)
+	h3Server, err := newHTTP3Server(ctx, name, config, httpsServer, sources)
 	if err != nil {
 		return nil, fmt.Errorf("creating HTTP3 server: %w", err)
 	}
@@ -257,7 +265,7 @@ func (e *TCPEntryPoint) Start(ctx context.Context) {
 	logger.Debug().Msg("Starting TCP Server")
 
 	if e.http3Server != nil {
-		go func() { _ = e.http3Server.Start() }()
+		go func() { _ = e.http3Server.Start(ctx) }()
 	}
 
 	for {
@@ -270,11 +278,8 @@ func (e *TCPEntryPoint) Start(ctx context.Context) {
 		if err != nil {
 			logger.Error().Err(err).Send()
 
-			if opErr, ok := errors.AsType[*net.OpError](err); ok && opErr.Temporary() {
-				continue
-			}
-
-			if urlErr, ok := errors.AsType[*url.Error](err); ok && urlErr.Temporary() {
+			// The same test as the merged listener's, which passes on only the errors this loop retries after.
+			if isTemporaryAcceptError(err) {
 				continue
 			}
 
@@ -286,7 +291,12 @@ func (e *TCPEntryPoint) Start(ctx context.Context) {
 
 		writeCloser, err := writeCloser(conn)
 		if err != nil {
-			panic(err)
+			// Not a panic: the connection may come from a source of the networks extension,
+			// and any peer of that network could then stop the process by connecting.
+			logger.Error().Err(err).Msg("Unable to serve the connection, closing it")
+			_ = conn.Close()
+
+			continue
 		}
 
 		safe.Go(func() {
@@ -423,14 +433,25 @@ func (c *writeCloserWrapper) CloseWrite() error {
 func writeCloser(conn net.Conn) (tcp.WriteCloser, error) {
 	switch typedConn := conn.(type) {
 	case *proxyproto.Conn:
-		underlying, ok := typedConn.TCPConn()
-		if !ok {
-			return nil, errors.New("underlying connection is not a tcp connection")
+		if underlying, ok := typedConn.TCPConn(); ok {
+			return &writeCloserWrapper{writeCloser: underlying, Conn: typedConn}, nil
 		}
-		return &writeCloserWrapper{writeCloser: underlying, Conn: typedConn}, nil
+		// The wrapped connection is not always a *net.TCPConn: one accepted
+		// on a userspace network stack is not, but still closes its write
+		// half.
+		if underlying, ok := typedConn.Raw().(tcp.WriteCloser); ok {
+			return &writeCloserWrapper{writeCloser: underlying, Conn: typedConn}, nil
+		}
+		return nil, errors.New("underlying connection is not a tcp connection")
 	case *net.TCPConn:
 		return typedConn, nil
 	default:
+		// Connections do not always come from a host socket. One accepted on
+		// a userspace network stack is not a *net.TCPConn, but it does
+		// implement CloseWrite, which is all the TCP proxying path needs.
+		if writeCloser, ok := conn.(tcp.WriteCloser); ok {
+			return writeCloser, nil
+		}
 		return nil, fmt.Errorf("unknown connection type %T", typedConn)
 	}
 }
@@ -480,13 +501,16 @@ func buildProxyProtocolListener(ctx context.Context, entryPoint *static.EntryPoi
 	}
 
 	proxyListener.Policy = func(upstream net.Addr) (proxyproto.Policy, error) {
-		ipAddr, ok := upstream.(*net.TCPAddr)
+		upstreamIP, ok := addrIP(upstream)
 		if !ok {
-			return proxyproto.REJECT, fmt.Errorf("type error %v", upstream)
+			// Not an error: one from a policy ends the listener, and with it the entryPoint.
+			// A peer with no IP to its address is in no list of trusted IPs.
+			log.Ctx(ctx).Debug().Msgf("Address %v has no IP to look for in trusted IPs list, ignoring ProxyProtocol Headers and bypass connection", upstream)
+			return proxyproto.IGNORE, nil
 		}
 
-		if !checker.ContainsIP(ipAddr.IP) {
-			log.Ctx(ctx).Debug().Msgf("IP %s is not in trusted IPs list, ignoring ProxyProtocol Headers and bypass connection", ipAddr.IP)
+		if !checker.ContainsIP(upstreamIP) {
+			log.Ctx(ctx).Debug().Msgf("IP %s is not in trusted IPs list, ignoring ProxyProtocol Headers and bypass connection", upstreamIP)
 			return proxyproto.IGNORE, nil
 		}
 		return proxyproto.USE, nil
@@ -495,6 +519,28 @@ func buildProxyProtocolListener(ctx context.Context, entryPoint *static.EntryPoi
 	log.Ctx(ctx).Info().Msgf("Enabling ProxyProtocol for trusted IPs %v", entryPoint.ProxyProtocol.TrustedIPs)
 
 	return proxyListener, nil
+}
+
+// addrIP returns the IP of a network address, when it has one.
+// A host socket has a *net.TCPAddr; a source of the networks extension has the address type of its network.
+func addrIP(addr net.Addr) (net.IP, bool) {
+	if addr == nil {
+		return nil, false
+	}
+
+	if tcpAddr, ok := addr.(*net.TCPAddr); ok {
+		return tcpAddr.IP, true
+	}
+
+	if addrPort, err := netip.ParseAddrPort(addr.String()); err == nil {
+		return addrPort.Addr().AsSlice(), true
+	}
+
+	if ip, err := netip.ParseAddr(addr.String()); err == nil {
+		return ip.AsSlice(), true
+	}
+
+	return nil, false
 }
 
 type onceCloseListener struct {
@@ -509,9 +555,50 @@ func (oc *onceCloseListener) Close() error {
 	return oc.closeErr
 }
 
-func buildListener(ctx context.Context, name string, config *static.EntryPoint) (net.Listener, error) {
+// buildListener returns the entryPoint's listener: its own address,
+// merged with the additional sources when it has any.
+func buildListener(ctx context.Context, name string, config *static.EntryPoint, sources network.Sources) (net.Listener, error) {
+	listener, err := buildOwnListener(ctx, name, config, sources.Primary)
+	if err != nil {
+		return nil, err
+	}
+
+	if len(sources.Additional) == 0 {
+		return listener, nil
+	}
+
+	// The entryPoint's proxyProtocol wraps its own listener only:
+	// on an additional source the peer is whoever the network says it is,
+	// and honoring a header there would let that peer claim any address it liked.
+	listeners := make([]net.Listener, 0, 1+len(sources.Additional))
+	listeners = append(listeners, listener)
+	for _, source := range sources.Additional {
+		listeners = append(listeners, &onceCloseListener{Listener: source.Listen(ctx)})
+	}
+
+	return &onceCloseListener{Listener: newMergedListener(ctx, listeners)}, nil
+}
+
+// buildOwnListener returns the listener on the entryPoint's own address:
+// on the primary source when the entryPoint has one, and on the host otherwise.
+func buildOwnListener(ctx context.Context, name string, config *static.EntryPoint, primary network.Source) (net.Listener, error) {
 	var listener net.Listener
 	var err error
+
+	if primary != nil {
+		// The source does not wait for its network: the listener binds within Accept,
+		// so a network that is not up at startup costs only this entryPoint.
+		listener = primary.Listen(ctx)
+
+		if config.ProxyProtocol != nil {
+			listener, err = buildProxyProtocolListener(ctx, config, listener)
+			if err != nil {
+				return nil, fmt.Errorf("error creating proxy protocol listener: %w", err)
+			}
+		}
+
+		return &onceCloseListener{Listener: listener}, nil
+	}
 
 	// if we have predefined listener from socket activation
 	if socketActivation.isEnabled() {

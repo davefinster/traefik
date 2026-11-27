@@ -6,8 +6,11 @@ import (
 	"fmt"
 	"io"
 	"net"
+	"net/netip"
 	"sync"
 	"time"
+
+	"github.com/rs/zerolog/log"
 )
 
 // maxDatagramSize is the maximum size of a UDP datagram.
@@ -19,7 +22,14 @@ var errClosedListener = errors.New("udp: listener closed")
 
 // Listener augments a session-oriented Listener over a UDP PacketConn.
 type Listener struct {
-	pConn *net.UDPConn
+	// pConn is a net.PacketConn rather than a *net.UDPConn because the
+	// packets do not always come from a host socket: a userspace network
+	// stack hands over a net.PacketConn of its own. Only the PacketConn
+	// methods are used either way.
+	pConn net.PacketConn
+	// dgram reads and writes pConn's datagrams, with the local address
+	// each was sent to where the socket says (datagramConn).
+	dgram datagramConn
 
 	mu    sync.RWMutex
 	conns map[string]*Conn
@@ -40,13 +50,13 @@ func ListenPacketConn(packetConn net.PacketConn, timeout time.Duration) (*Listen
 		return nil, errors.New("timeout should be greater than zero")
 	}
 
-	pConn, ok := packetConn.(*net.UDPConn)
-	if !ok {
-		return nil, errors.New("packet conn is not an UDPConn")
+	if packetConn == nil {
+		return nil, errors.New("packet conn is required")
 	}
 
 	l := &Listener{
-		pConn:     pConn,
+		pConn:     packetConn,
+		dgram:     newDatagramConn(packetConn),
 		acceptCh:  make(chan *Conn),
 		conns:     make(map[string]*Conn),
 		accepting: true,
@@ -151,11 +161,19 @@ func (l *Listener) readLoop() {
 	buf := make([]byte, maxDatagramSize)
 
 	for {
-		n, raddr, err := l.pConn.ReadFrom(buf)
+		n, raddr, local, err := l.dgram.readFrom(buf)
 		if err != nil {
+			l.fail(err)
 			return
 		}
-		conn, err := l.getConn(raddr)
+
+		// Not every packet conn names the sender: a unix datagram socket does not, for a peer that is not bound.
+		// A session is keyed by that address and replies to it, so there is none to open without one.
+		if raddr == nil {
+			continue
+		}
+
+		conn, err := l.getConn(raddr, local)
 		if err != nil {
 			continue
 		}
@@ -174,13 +192,33 @@ func (l *Listener) readLoop() {
 	}
 }
 
-// getConn returns the ongoing session with raddr if it exists, or creates a new
-// one otherwise.
-func (l *Listener) getConn(raddr net.Addr) (*Conn, error) {
+// fail closes the listener after a read error that is not its own closing.
+// Nothing reads the conn past such an error, so left open the listener would look alive and serve nothing:
+// its sessions would hang, and Accept would never return.
+func (l *Listener) fail(err error) {
+	l.mu.Lock()
+	if !l.accepting {
+		// Shutdown is under way or done, and closes the listener itself:
+		// the error is the conn being closed, or is about to be moot.
+		l.mu.Unlock()
+		return
+	}
+	l.accepting = false
+	l.mu.Unlock()
+
+	log.Error().Err(err).Stringer("address", l.pConn.LocalAddr()).Msg("Error while reading UDP packets, closing the listener")
+
+	_ = l.close()
+}
+
+// getConn returns the ongoing session with raddr at local if it exists, or
+// creates a new one otherwise.
+func (l *Listener) getConn(raddr net.Addr, local netip.Addr) (*Conn, error) {
 	l.mu.Lock()
 	defer l.mu.Unlock()
 
-	conn, ok := l.conns[raddr.String()]
+	key := sessionKey(raddr, local)
+	conn, ok := l.conns[key]
 	if ok {
 		return conn, nil
 	}
@@ -188,18 +226,19 @@ func (l *Listener) getConn(raddr net.Addr) (*Conn, error) {
 	if !l.accepting {
 		return nil, errClosedListener
 	}
-	conn = l.newConn(raddr)
-	l.conns[raddr.String()] = conn
+	conn = l.newConn(raddr, local)
+	l.conns[key] = conn
 	l.acceptCh <- conn
 	go conn.readLoop()
 
 	return conn, nil
 }
 
-func (l *Listener) newConn(rAddr net.Addr) *Conn {
+func (l *Listener) newConn(rAddr net.Addr, local netip.Addr) *Conn {
 	return &Conn{
 		listener:  l,
 		rAddr:     rAddr,
+		local:     local,
 		receiveCh: make(chan []byte),
 		readCh:    make(chan []byte),
 		sizeCh:    make(chan int),
@@ -212,6 +251,9 @@ func (l *Listener) newConn(rAddr net.Addr) *Conn {
 type Conn struct {
 	listener *Listener
 	rAddr    net.Addr
+	// local is the address the client sends to, and the one replies are
+	// sent from, where the listener's socket says (datagramConn).
+	local netip.Addr
 
 	receiveCh chan []byte // to receive the data from the listener's readLoop
 	readCh    chan []byte // to receive the buffer into which we should Read
@@ -251,7 +293,7 @@ func (c *Conn) Write(p []byte) (n int, err error) {
 	c.lastActivity = time.Now()
 	c.muActivity.Unlock()
 
-	return c.listener.pConn.WriteTo(p, c.rAddr)
+	return c.listener.dgram.writeTo(p, c.rAddr, c.local)
 }
 
 // Close releases resources related to the Conn.
@@ -260,7 +302,7 @@ func (c *Conn) Close() error {
 
 	c.listener.mu.Lock()
 	defer c.listener.mu.Unlock()
-	delete(c.listener.conns, c.rAddr.String())
+	delete(c.listener.conns, sessionKey(c.rAddr, c.local))
 	return nil
 }
 

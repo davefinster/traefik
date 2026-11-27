@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"io"
 	"net"
+	"net/netip"
 	"sync"
 	"time"
 
@@ -26,6 +27,9 @@ type Listener struct {
 	// stack hands over a net.PacketConn of its own. Only the PacketConn
 	// methods are used either way.
 	pConn net.PacketConn
+	// dgram reads and writes pConn's datagrams, with the local address
+	// each was sent to where the socket says (datagramConn).
+	dgram datagramConn
 
 	mu    sync.RWMutex
 	conns map[string]*Conn
@@ -52,6 +56,7 @@ func ListenPacketConn(packetConn net.PacketConn, timeout time.Duration) (*Listen
 
 	l := &Listener{
 		pConn:     packetConn,
+		dgram:     newDatagramConn(packetConn),
 		acceptCh:  make(chan *Conn),
 		conns:     make(map[string]*Conn),
 		accepting: true,
@@ -156,7 +161,7 @@ func (l *Listener) readLoop() {
 	buf := make([]byte, maxDatagramSize)
 
 	for {
-		n, raddr, err := l.pConn.ReadFrom(buf)
+		n, raddr, local, err := l.dgram.readFrom(buf)
 		if err != nil {
 			l.fail(err)
 			return
@@ -168,7 +173,7 @@ func (l *Listener) readLoop() {
 			continue
 		}
 
-		conn, err := l.getConn(raddr)
+		conn, err := l.getConn(raddr, local)
 		if err != nil {
 			continue
 		}
@@ -206,13 +211,14 @@ func (l *Listener) fail(err error) {
 	_ = l.close()
 }
 
-// getConn returns the ongoing session with raddr if it exists, or creates a new
-// one otherwise.
-func (l *Listener) getConn(raddr net.Addr) (*Conn, error) {
+// getConn returns the ongoing session with raddr at local if it exists, or
+// creates a new one otherwise.
+func (l *Listener) getConn(raddr net.Addr, local netip.Addr) (*Conn, error) {
 	l.mu.Lock()
 	defer l.mu.Unlock()
 
-	conn, ok := l.conns[raddr.String()]
+	key := sessionKey(raddr, local)
+	conn, ok := l.conns[key]
 	if ok {
 		return conn, nil
 	}
@@ -220,18 +226,19 @@ func (l *Listener) getConn(raddr net.Addr) (*Conn, error) {
 	if !l.accepting {
 		return nil, errClosedListener
 	}
-	conn = l.newConn(raddr)
-	l.conns[raddr.String()] = conn
+	conn = l.newConn(raddr, local)
+	l.conns[key] = conn
 	l.acceptCh <- conn
 	go conn.readLoop()
 
 	return conn, nil
 }
 
-func (l *Listener) newConn(rAddr net.Addr) *Conn {
+func (l *Listener) newConn(rAddr net.Addr, local netip.Addr) *Conn {
 	return &Conn{
 		listener:  l,
 		rAddr:     rAddr,
+		local:     local,
 		receiveCh: make(chan []byte),
 		readCh:    make(chan []byte),
 		sizeCh:    make(chan int),
@@ -244,6 +251,9 @@ func (l *Listener) newConn(rAddr net.Addr) *Conn {
 type Conn struct {
 	listener *Listener
 	rAddr    net.Addr
+	// local is the address the client sends to, and the one replies are
+	// sent from, where the listener's socket says (datagramConn).
+	local netip.Addr
 
 	receiveCh chan []byte // to receive the data from the listener's readLoop
 	readCh    chan []byte // to receive the buffer into which we should Read
@@ -283,7 +293,7 @@ func (c *Conn) Write(p []byte) (n int, err error) {
 	c.lastActivity = time.Now()
 	c.muActivity.Unlock()
 
-	return c.listener.pConn.WriteTo(p, c.rAddr)
+	return c.listener.dgram.writeTo(p, c.rAddr, c.local)
 }
 
 // Close releases resources related to the Conn.
@@ -292,7 +302,7 @@ func (c *Conn) Close() error {
 
 	c.listener.mu.Lock()
 	defer c.listener.mu.Unlock()
-	delete(c.listener.conns, c.rAddr.String())
+	delete(c.listener.conns, sessionKey(c.rAddr, c.local))
 	return nil
 }
 
